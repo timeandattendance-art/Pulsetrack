@@ -4,7 +4,8 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python pipeline/pipeline.py data/leads.csv",
+    "startCommand": "python -m pipeline.pipeline data/leads.csv",
     "restartPolicyType": "NEVER"
   }
 }
+
