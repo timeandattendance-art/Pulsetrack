@@ -13,6 +13,7 @@ proved out by hand on the Union Yoga case earlier.
 """
 
 import json
+import time
 import httpx
 import anthropic
 from pipeline.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, BRAVE_API_KEY, TIER3_BATCH_SIZE
@@ -71,31 +72,67 @@ Web search result snippets:
 Classify this company per the rules above."""
 
 
-def search_company(company_name: str, n_results: int = 5) -> str:
+class BraveQuotaExceeded(Exception):
+    """Raised when Brave Search returns a rate-limit/quota error that
+    persists after retries — signals the caller to stop immediately
+    rather than keep burning calls against an exhausted/blocked key."""
+    pass
+
+
+def search_company(company_name: str, n_results: int = 5, max_retries: int = 3) -> str:
     """
     Runs a Brave Search API query and returns formatted snippet text.
     Swap this function out if using a different search provider.
+
+    Transient rate limits (HTTP 429) are retried with backoff, since
+    Brave's free/low tiers often rate-limit per-second rather than being
+    truly out of monthly quota. If it's still failing after retries, or
+    the response indicates the quota itself is exhausted (402), this
+    raises BraveQuotaExceeded so the run stops cleanly instead of
+    silently burning through (and potentially still being billed for)
+    further failed calls.
     """
     if not BRAVE_API_KEY:
         raise RuntimeError("BRAVE_API_KEY not set — required for Tier 3 search step")
 
-    resp = httpx.get(
-        "https://api.search.brave.com/res/v1/web/search",
-        headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
-        params={"q": f"{company_name} CEO owner about", "count": n_results},
-        timeout=15,
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            resp = httpx.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
+                params={"q": f"{company_name} CEO owner about", "count": n_results},
+                timeout=15,
+            )
+            if resp.status_code == 402:
+                raise BraveQuotaExceeded(
+                    f"Brave Search returned 402 (payment/quota exhausted) for '{company_name}'. "
+                    f"Stopping Tier 3 — no further search calls will be made this run."
+                )
+            if resp.status_code == 429:
+                last_error = f"429 rate-limited on attempt {attempt + 1}/{max_retries}"
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("web", {}).get("results", [])
+            snippets = []
+            for r in results[:n_results]:
+                title = r.get("title", "")
+                desc = r.get("description", "")
+                snippets.append(f"- {title}: {desc}")
+            return "\n".join(snippets) if snippets else "(no search results found)"
+        except BraveQuotaExceeded:
+            raise
+        except httpx.HTTPStatusError as e:
+            last_error = str(e)
+            break
+
+    raise BraveQuotaExceeded(
+        f"Brave Search failed for '{company_name}' after {max_retries} attempts "
+        f"({last_error}). Stopping Tier 3 rather than continuing to burn calls "
+        f"against a key that may be rate-limited or out of quota."
     )
-    resp.raise_for_status()
-    data = resp.json()
-    results = data.get("web", {}).get("results", [])
-
-    snippets = []
-    for r in results[:n_results]:
-        title = r.get("title", "")
-        desc = r.get("description", "")
-        snippets.append(f"- {title}: {desc}")
-
-    return "\n".join(snippets) if snippets else "(no search results found)"
 
 
 def build_batch_requests(companies: list[dict]) -> list[dict]:

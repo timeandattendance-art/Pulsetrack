@@ -63,6 +63,18 @@ def send_run_failed(tier: str, error: str) -> None:
     _send(subject, body)
 
 
+def send_budget_exceeded(provider: str, detail: str) -> None:
+    subject = f"PulseTrack STOPPED — {provider} budget/quota exhausted"
+    body = (
+        f"The pipeline stopped itself rather than keep spending against "
+        f"{provider} once it hit a quota/rate-limit error it couldn't recover from.\n\n"
+        f"Detail:\n{detail}\n\n"
+        f"No further {provider} calls were made after this point. "
+        f"Top this up and re-run if you want the remaining companies processed."
+    )
+    _send(subject, body)
+
+
 def send_rate_limit_warning(provider: str, company_key: str) -> None:
     subject = f"PulseTrack rate limit hit — {provider}"
     body = (

@@ -22,9 +22,9 @@ from pipeline.drive_fetch import fetch_all_csvs
 from pipeline.merge_leads import merge_and_tag
 from pipeline.tier0_local_signals import run_tier0
 from pipeline.tier1_website_scrape import run_tier1_batch
-from pipeline.tier3_search_classify import submit_batch
+from pipeline.tier3_search_classify import submit_batch, BraveQuotaExceeded
 from pipeline.db import get_conn, upsert_company, insert_person, log_pipeline_run
-from pipeline.alerts import send_run_completed, send_run_failed
+from pipeline.alerts import send_run_completed, send_run_failed, send_budget_exceeded
 
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 DATA_DIR = "data"
@@ -171,10 +171,25 @@ def main():
         if len(residual) > 0:
             print(f"=== TIER 3: submitting {len(residual)} companies to search + Claude batch ===")
             residual_companies = residual.to_dict("records")
-            batch_id = submit_batch(residual_companies)
-            print(f"Tier 3 batch submitted: {batch_id}")
-            print("Run `python pipeline_tier3_collect.py <batch_id>` once the batch finishes.")
-            run_summary["needs_review_count"] += len(residual)
+            try:
+                batch_id = submit_batch(residual_companies)
+                print(f"Tier 3 batch submitted: {batch_id}")
+                print("Run `python pipeline_tier3_collect.py <batch_id>` once the batch finishes.")
+                run_summary["needs_review_count"] += len(residual)
+            except BraveQuotaExceeded as e:
+                print(f"=== BRAVE QUOTA/RATE LIMIT EXCEEDED — stopping Tier 3 ===\n{e}")
+                run_summary["needs_review_count"] += len(residual)
+                write_split_outputs(tagged, run_summary)
+                with get_conn() as conn:
+                    log_pipeline_run(
+                        conn, "tier3_stopped_budget",
+                        run_summary["companies_processed"],
+                        run_summary["companies_resolved"],
+                        notes=str(e),
+                    )
+                send_budget_exceeded("Brave Search", str(e))
+                print("Run halted cleanly — everything resolved so far is saved and in Supabase.")
+                return
 
         write_split_outputs(tagged, run_summary)
 
