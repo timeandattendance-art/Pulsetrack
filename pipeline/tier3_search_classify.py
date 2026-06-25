@@ -16,7 +16,7 @@ import json
 import time
 import httpx
 import anthropic
-from pipeline.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, BRAVE_API_KEY, TIER3_BATCH_SIZE
+from pipeline.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, SERPER_API_KEY, TIER3_BATCH_SIZE
 
 SYSTEM_PROMPT = """You are a careful data-classification assistant for a B2B lead database.
 You will be given a company name and a set of web search result snippets about that company.
@@ -72,41 +72,39 @@ Web search result snippets:
 Classify this company per the rules above."""
 
 
-class BraveQuotaExceeded(Exception):
-    """Raised when Brave Search returns a rate-limit/quota error that
-    persists after retries — signals the caller to stop immediately
-    rather than keep burning calls against an exhausted/blocked key."""
+class SearchQuotaExceeded(Exception):
+    """Raised when Serper returns a quota/payment error that persists
+    after retries — signals the caller to stop immediately rather than
+    keep burning calls against an exhausted/blocked key."""
     pass
 
 
 def search_company(company_name: str, n_results: int = 5, max_retries: int = 3) -> str:
     """
-    Runs a Brave Search API query and returns formatted snippet text.
+    Runs a Serper.dev Google search and returns formatted snippet text.
     Swap this function out if using a different search provider.
 
-    Transient rate limits (HTTP 429) are retried with backoff, since
-    Brave's free/low tiers often rate-limit per-second rather than being
-    truly out of monthly quota. If it's still failing after retries, or
-    the response indicates the quota itself is exhausted (402), this
-    raises BraveQuotaExceeded so the run stops cleanly instead of
-    silently burning through (and potentially still being billed for)
-    further failed calls.
+    Transient rate limits (HTTP 429) are retried with backoff. If it's
+    still failing after retries, or the response indicates the quota
+    itself is exhausted (402/403), this raises SearchQuotaExceeded so
+    the run stops cleanly instead of silently burning through (and
+    potentially still being billed for) further failed calls.
     """
-    if not BRAVE_API_KEY:
-        raise RuntimeError("BRAVE_API_KEY not set — required for Tier 3 search step")
+    if not SERPER_API_KEY:
+        raise RuntimeError("SERPER_API_KEY not set — required for Tier 3 search step")
 
     last_error = None
     for attempt in range(max_retries):
         try:
-            resp = httpx.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
-                params={"q": f"{company_name} CEO owner about", "count": n_results},
+            resp = httpx.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json={"q": f"{company_name} CEO owner about", "num": n_results},
                 timeout=15,
             )
-            if resp.status_code == 402:
-                raise BraveQuotaExceeded(
-                    f"Brave Search returned 402 (payment/quota exhausted) for '{company_name}'. "
+            if resp.status_code in (402, 403):
+                raise SearchQuotaExceeded(
+                    f"Serper returned {resp.status_code} (payment/quota issue) for '{company_name}'. "
                     f"Stopping Tier 3 — no further search calls will be made this run."
                 )
             if resp.status_code == 429:
@@ -115,21 +113,21 @@ def search_company(company_name: str, n_results: int = 5, max_retries: int = 3) 
                 continue
             resp.raise_for_status()
             data = resp.json()
-            results = data.get("web", {}).get("results", [])
+            results = data.get("organic", [])
             snippets = []
             for r in results[:n_results]:
                 title = r.get("title", "")
-                desc = r.get("description", "")
+                desc = r.get("snippet", "")
                 snippets.append(f"- {title}: {desc}")
             return "\n".join(snippets) if snippets else "(no search results found)"
-        except BraveQuotaExceeded:
+        except SearchQuotaExceeded:
             raise
         except httpx.HTTPStatusError as e:
             last_error = str(e)
             break
 
-    raise BraveQuotaExceeded(
-        f"Brave Search failed for '{company_name}' after {max_retries} attempts "
+    raise SearchQuotaExceeded(
+        f"Serper search failed for '{company_name}' after {max_retries} attempts "
         f"({last_error}). Stopping Tier 3 rather than continuing to burn calls "
         f"against a key that may be rate-limited or out of quota."
     )
