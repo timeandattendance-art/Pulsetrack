@@ -1,4 +1,4 @@
-﻿"""
+"""
 config.py — shared configuration for the PulseTrack enrichment pipeline.
 All secrets are read from environment variables. On Railway, set these
 in the project's Variables tab. Locally, copy .env.example to .env and

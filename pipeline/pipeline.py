@@ -1,5 +1,5 @@
- """
-pipeline.py — orchestrates the full PulseTrack run:
+"""
+pipeline.py - orchestrates the full PulseTrack run:
 
     1. Pull all source CSVs from the shared Google Drive folder
     2. Merge them into one dataframe, tagging conflicts (nothing deleted)
@@ -183,7 +183,7 @@ def main():
                 print("Run `python pipeline_tier3_collect.py <batch_id>` once the batch finishes.")
                 run_summary["needs_review_count"] += len(residual_companies)
             except SearchQuotaExceeded as e:
-                print(f"=== SERPER QUOTA/RATE LIMIT EXCEEDED — stopping Tier 3 ===\n{e}")
+                print(f"=== SERPER QUOTA/RATE LIMIT EXCEEDED - stopping Tier 3 ===\n{e}")
                 run_summary["needs_review_count"] += len(residual_companies)
                 write_split_outputs(tagged, run_summary)
                 with get_conn() as conn:
@@ -194,7 +194,7 @@ def main():
                         notes=str(e),
                     )
                 send_budget_exceeded("Serper", str(e))
-                print("Run halted cleanly — everything resolved so far is saved and in Supabase.")
+                print("Run halted cleanly - everything resolved so far is saved and in Supabase.")
                 return
 
         write_split_outputs(tagged, run_summary)
