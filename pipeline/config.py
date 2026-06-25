@@ -21,5 +21,6 @@ SEARCH_PROVIDER = os.environ.get("SEARCH_PROVIDER", "serper")
 TIER1_CONCURRENCY = int(os.environ.get("TIER1_CONCURRENCY", "10"))
 TIER1_TIMEOUT_SECONDS = int(os.environ.get("TIER1_TIMEOUT_SECONDS", "10"))
 TIER3_BATCH_SIZE = int(os.environ.get("TIER3_BATCH_SIZE", "20"))
+TIER3_TEST_LIMIT = int(os.environ.get("TIER3_TEST_LIMIT", "0"))
 # Staff bucket values observed in source data (ceiling, not exact count)
 STAFF_BUCKETS = [30, 125, 350, 10001]

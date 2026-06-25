@@ -1,4 +1,4 @@
-"""
+ """
 pipeline.py — orchestrates the full PulseTrack run:
 
     1. Pull all source CSVs from the shared Google Drive folder
@@ -23,6 +23,7 @@ from pipeline.merge_leads import merge_and_tag
 from pipeline.tier0_local_signals import run_tier0
 from pipeline.tier1_website_scrape import run_tier1_batch
 from pipeline.tier3_search_classify import submit_batch, SearchQuotaExceeded
+from pipeline.config import TIER3_TEST_LIMIT
 from pipeline.db import get_conn, upsert_company, insert_person, log_pipeline_run
 from pipeline.alerts import send_run_completed, send_run_failed, send_budget_exceeded
 
@@ -169,16 +170,21 @@ def main():
                   f"{len(residual)} pass to Tier 3 (search + Claude batch).")
 
         if len(residual) > 0:
-            print(f"=== TIER 3: submitting {len(residual)} companies to search + Claude batch ===")
             residual_companies = residual.to_dict("records")
+            if TIER3_TEST_LIMIT > 0:
+                residual_companies = residual_companies[:TIER3_TEST_LIMIT]
+                print(f"=== TIER 3 TEST MODE: limiting to first {len(residual_companies)} "
+                      f"of {len(residual)} companies (TIER3_TEST_LIMIT set) ===")
+            else:
+                print(f"=== TIER 3: submitting {len(residual_companies)} companies to search + Claude batch ===")
             try:
                 batch_id = submit_batch(residual_companies)
                 print(f"Tier 3 batch submitted: {batch_id}")
                 print("Run `python pipeline_tier3_collect.py <batch_id>` once the batch finishes.")
-                run_summary["needs_review_count"] += len(residual)
+                run_summary["needs_review_count"] += len(residual_companies)
             except SearchQuotaExceeded as e:
                 print(f"=== SERPER QUOTA/RATE LIMIT EXCEEDED — stopping Tier 3 ===\n{e}")
-                run_summary["needs_review_count"] += len(residual)
+                run_summary["needs_review_count"] += len(residual_companies)
                 write_split_outputs(tagged, run_summary)
                 with get_conn() as conn:
                     log_pipeline_run(
