@@ -120,12 +120,52 @@ def get_companies_by_status(conn, status: str, limit: int = None):
     return cur.fetchall()
 
 
-def log_pipeline_run(conn, tier: str, processed: int, resolved: int, notes: str = ""):
+def log_pipeline_run(conn, tier: str, processed: int, resolved: int, notes: str = "",
+                      cost_usd: float = 0.0, api_calls_made: int = 0,
+                      rate_limited_count: int = 0, failed_count: int = 0, status: str = "ok"):
     cur = conn.cursor()
     cur.execute(
         """
-        insert into pipeline_runs (tier, finished_at, companies_processed, companies_resolved, notes)
-        values (%s, now(), %s, %s, %s)
+        insert into pipeline_runs (
+            tier, finished_at, companies_processed, companies_resolved, notes,
+            cost_usd, api_calls_made, rate_limited_count, failed_count, status
+        )
+        values (%s, now(), %s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (tier, processed, resolved, notes),
+        (tier, processed, resolved, notes, cost_usd, api_calls_made,
+         rate_limited_count, failed_count, status),
     )
+
+
+def log_tier3_search(conn, company_name: str, snippets: str, status: str):
+    """
+    Checkpoint a single Tier 3 search result immediately after it completes,
+    so a crash mid-batch doesn't lose (or force re-paying for) work already done.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        insert into tier3_search_log (company_name, snippets, status)
+        values (%s, %s, %s)
+        """,
+        (company_name, snippets, status),
+    )
+
+
+def get_already_searched_companies(conn) -> dict:
+    """
+    Returns a dict of {company_name: snippets} for every company that already
+    has a successful Tier 3 search logged, so a resumed run can skip them
+    instead of paying Serper again for the same company.
+    """
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        """
+        select distinct on (company_name) company_name, snippets
+        from tier3_search_log
+        where status = 'success'
+        order by company_name, searched_at desc
+        """
+    )
+    rows = cur.fetchall()
+    return {row["company_name"]: row["snippets"] for row in rows}
