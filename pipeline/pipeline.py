@@ -33,6 +33,81 @@ RAW_DIR = os.path.join(DATA_DIR, "raw_from_drive")
 MERGED_PATH = os.path.join(DATA_DIR, "leads.csv")
 OUTPUT_DIR = "outputs"
 
+# Column names as they appear in the merged source CSV.
+# IMPORTANT: real name data lives in the ".1" suffixed columns,
+# the plain "First Name"/"Last Name" columns are empty vendor artifacts.
+COL_FIRST_NAME = "First Name.1"
+COL_LAST_NAME = "Last Name.1"
+COL_FULL_NAME = "Contact Full Name"
+COL_TITLE = "Title"
+COL_EMAIL = "Email"
+COL_PHONE = "Phone"
+COL_LINKEDIN = "LinkedIn Url"
+COL_NAME_CLEANED = "Company Name - Cleaned"
+
+
+def safe_get(row, col, default=None):
+    if col in row.index:
+        val = row[col]
+        if pd.isna(val):
+            return default
+        return val
+    return default
+
+
+def build_person_record(row, company_id: str, raw_source_file: str) -> dict:
+    full_name = safe_get(row, COL_FULL_NAME)
+    first_name = safe_get(row, COL_FIRST_NAME)
+    last_name = safe_get(row, COL_LAST_NAME)
+    if not full_name and (first_name or last_name):
+        full_name = f"{first_name or ''} {last_name or ''}".strip()
+
+    return {
+        "company_id": company_id,
+        "full_name": full_name,
+        "first_name": first_name,
+        "last_name": last_name,
+        "title": safe_get(row, COL_TITLE),
+        "title_normalized": None,
+        "seniority": None,
+        "email": safe_get(row, COL_EMAIL),
+        "email_validation": None,
+        "phone": safe_get(row, COL_PHONE),
+        "linkedin_url": safe_get(row, COL_LINKEDIN),
+        "is_current": True,
+        "resolution_confidence": None,
+        "resolution_source": raw_source_file,
+        "time_in_role_months": None,
+        "time_at_company_months": None,
+        "job_change_type": None,
+        "raw_source_file": raw_source_file,
+    }
+
+
+def insert_people_for_company(conn, raw_df: pd.DataFrame, name_cleaned: str,
+                               company_id: str, source_tag: str) -> int:
+    """
+    Looks up all contact rows for a resolved company in the raw merged data
+    and inserts a person record for each one. Returns count inserted.
+    """
+    if COL_NAME_CLEANED not in raw_df.columns:
+        return 0
+    group = raw_df[raw_df[COL_NAME_CLEANED] == name_cleaned]
+    inserted = 0
+    for _, row in group.iterrows():
+        person_record = build_person_record(row, company_id, source_tag)
+        if not person_record["full_name"] and not person_record["email"]:
+            continue
+        insert_person(conn, person_record)
+        inserted += 1
+    return inserted
+
+
+def is_junk_company_name(name) -> bool:
+    if not name or not isinstance(name, str):
+        return True
+    return len(name.strip()) < 2
+
 
 def fetch_and_merge_source_data() -> pd.DataFrame:
     print(f"=== Fetching source CSVs from Drive folder {DRIVE_FOLDER_ID} ===")
@@ -85,10 +160,14 @@ def main():
         "rate_limited_count": 0,
         "api_calls_made": 0,
         "cost_usd": 0.0,
+        "people_inserted": 0,
     }
 
     try:
         tagged = fetch_and_merge_source_data()
+
+        # Loaded once, reused for person-insertion lookups across all tiers
+        raw_df = pd.read_csv(MERGED_PATH, dtype=str, low_memory=False)
 
         print(f"=== TIER 0: local signal resolution on {MERGED_PATH} ===")
         tier0_results = run_tier0(MERGED_PATH)
@@ -115,9 +194,12 @@ def main():
                     "classification_evidence": row["classification_evidence"],
                     "resolution_status": row["resolution_status"],
                 }
-                upsert_company(conn, company_record)
+                company_id = upsert_company(conn, company_record)
+                run_summary["people_inserted"] += insert_people_for_company(
+                    conn, raw_df, row["name_cleaned"], company_id, "tier0_auto_resolved"
+                )
             log_pipeline_run(conn, "tier0", len(tier0_results), len(auto_resolved),
-                            cost_usd=0.0, api_calls_made=0)
+                              cost_usd=0.0, api_calls_made=0)
 
         print(f"Tier 0 resolved {len(auto_resolved)} / {len(tier0_results)} companies. "
               f"{len(needs_review)} pass to Tier 1.")
@@ -127,15 +209,14 @@ def main():
 
         if len(needs_review) > 0:
             print(f"=== TIER 1: website scraping for {len(needs_review)} companies ===")
-            raw_df = pd.read_csv(MERGED_PATH, dtype=str, low_memory=False)
             companies_to_check = []
             for _, row in needs_review.iterrows():
-                group = raw_df[raw_df["Company Name - Cleaned"] == row["name_cleaned"]]
+                group = raw_df[raw_df[COL_NAME_CLEANED] == row["name_cleaned"]]
                 domain = (group["Website"].dropna().iloc[0]
                           if "Website" in group.columns and not group["Website"].dropna().empty
                           else None)
-                names = (group["Contact Full Name"].dropna().unique().tolist()
-                         if "Contact Full Name" in group.columns else [])
+                names = (group[COL_FULL_NAME].dropna().unique().tolist()
+                         if COL_FULL_NAME in group.columns else [])
                 companies_to_check.append({
                     "name_cleaned": row["name_cleaned"], "domain": domain,
                     "candidate_names": names, "n_contacts": row["n_contacts"],
@@ -164,28 +245,55 @@ def main():
                         "classification_evidence": row["evidence"],
                         "resolution_status": "auto_resolved",
                     }
-                    upsert_company(conn, company_record)
+                    company_id = upsert_company(conn, company_record)
+                    run_summary["people_inserted"] += insert_people_for_company(
+                        conn, raw_df, row["name_cleaned"], company_id, "tier1_website"
+                    )
                 log_pipeline_run(conn, "tier1", len(tier1_df), len(resolved_tier1),
-                                cost_usd=0.0, api_calls_made=0)
+                                  cost_usd=0.0, api_calls_made=0)
 
             print(f"Tier 1 resolved {len(resolved_tier1)} / {len(tier1_df)}. "
                   f"{len(residual)} pass to Tier 3 (search + Claude batch).")
 
         if len(residual) > 0:
             residual_companies = residual.to_dict("records")
+
+            # Dedupe by name_cleaned before sending to Tier 3, and drop junk names
+            seen_names = set()
+            deduped = []
+            for c in residual_companies:
+                name = c.get("name_cleaned")
+                if is_junk_company_name(name):
+                    continue
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                deduped.append(c)
+            dropped = len(residual_companies) - len(deduped)
+            if dropped > 0:
+                print(f"Dropped {dropped} junk/duplicate company names before Tier 3.")
+            residual_companies = deduped
+
             if TIER3_TEST_LIMIT > 0:
                 residual_companies = residual_companies[:TIER3_TEST_LIMIT]
                 print(f"=== TIER 3 TEST MODE: limiting to first {len(residual_companies)} "
                       f"of {len(residual)} companies (TIER3_TEST_LIMIT set) ===")
             else:
                 print(f"=== TIER 3: submitting {len(residual_companies)} companies to search + Claude batch ===")
+
             try:
                 batch_id = submit_batch(residual_companies)
                 print(f"Tier 3 batch submitted: {batch_id}")
                 print("Run `python pipeline_tier3_collect.py <batch_id>` once the batch finishes.")
                 run_summary["needs_review_count"] += len(residual_companies)
             except SearchQuotaExceeded as e:
+                # Anything searched successfully before this exception was already
+                # checkpointed to tier3_search_log in Supabase by submit_batch's
+                # internal checkpointing, it is NOT lost even though we stop here.
                 print(f"=== SERPER QUOTA/RATE LIMIT EXCEEDED - stopping Tier 3 ===\n{e}")
+                print("Note: any companies already searched successfully before this error "
+                      "are checkpointed in Supabase (tier3_search_log) and will be skipped, "
+                      "not re-paid for, on the next run.")
                 run_summary["needs_review_count"] += len(residual_companies)
                 write_split_outputs(tagged, run_summary)
                 with get_conn() as conn:
@@ -200,7 +308,7 @@ def main():
                         status="quota_exceeded",
                     )
                 send_budget_exceeded("Serper", str(e))
-                print("Run halted cleanly - everything resolved so far is saved and in Supabase.")
+                print("Run halted cleanly, everything resolved so far is saved and in Supabase.")
                 return
 
         write_split_outputs(tagged, run_summary)
@@ -217,7 +325,7 @@ def main():
             )
 
         send_run_completed(run_summary)
-        print("=== Run complete ===")
+        print(f"=== Run complete. {run_summary['people_inserted']} people inserted. ===")
 
     except Exception as e:
         error_text = traceback.format_exc()
