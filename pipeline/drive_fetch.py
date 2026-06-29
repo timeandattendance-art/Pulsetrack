@@ -1,25 +1,26 @@
 """
-drive_fetch.py — downloads CSV files from a shared Google Drive folder
-using a service account, so the pipeline always pulls fresh source data
-without anything being committed to git.
+drive_fetch.py — downloads source CSVs from a shared Google Drive folder,
+and uploads the final output CSV back to that same folder, using a service
+account, so the pipeline always pulls fresh source data and delivers the
+final result without anything being committed to git or stuck in Railway's
+ephemeral filesystem.
 
 Auth: expects GOOGLE_SERVICE_ACCOUNT_JSON env var to contain the full
 contents of the service account's JSON key (the raw JSON text itself,
 not a file path — Railway env vars are text).
 
-Source data location: DRIVE_FOLDER_ID env var, the folder shared with
-the service account as Viewer.
+Source/destination location: DRIVE_FOLDER_ID env var, the folder shared
+with the service account as Editor (upgraded from Viewer so the final
+CSV can be uploaded back into it).
 """
-
 import os
 import json
 import io
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def _get_drive_service():
@@ -76,7 +77,7 @@ def fetch_all_csvs(folder_id: str, dest_dir: str) -> list[str]:
     if not files:
         raise RuntimeError(
             f"No CSV files found in Drive folder {folder_id} — "
-            f"check the folder is shared with the service account as Viewer."
+            f"check the folder is shared with the service account as Editor."
         )
     local_paths = []
     for f in files:
@@ -85,3 +86,34 @@ def fetch_all_csvs(folder_id: str, dest_dir: str) -> list[str]:
         download_file(f["id"], dest_path)
         local_paths.append(dest_path)
     return local_paths
+
+
+def upload_file(local_path: str, folder_id: str, drive_filename: str = None) -> str:
+    """
+    Uploads a local file to the given Drive folder. If a file with the
+    same name already exists there, it overwrites it (updates in place)
+    rather than creating a duplicate copy on every run.
+
+    Returns the Drive file ID of the uploaded/updated file.
+    """
+    service = _get_drive_service()
+    filename = drive_filename or os.path.basename(local_path)
+
+    existing_query = (
+        f"'{folder_id}' in parents and name='{filename}' and trashed=false"
+    )
+    existing = service.files().list(q=existing_query, fields="files(id, name)").execute()
+    existing_files = existing.get("files", [])
+
+    media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
+
+    if existing_files:
+        file_id = existing_files[0]["id"]
+        updated = service.files().update(fileId=file_id, media_body=media).execute()
+        print(f"  Updated existing Drive file: {filename} (id: {updated['id']})")
+        return updated["id"]
+    else:
+        file_metadata = {"name": filename, "parents": [folder_id]}
+        created = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        print(f"  Created new Drive file: {filename} (id: {created['id']})")
+        return created["id"]

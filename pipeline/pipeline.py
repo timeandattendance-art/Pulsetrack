@@ -8,11 +8,16 @@ pipeline.py - orchestrates the full PulseTrack run:
        resolution_status, so Supabase becomes the single durable
        source of truth for the entire dataset
     5. Write three local CSVs: leads / manual_review / run_summary,
-       plus tier3_results.json (per-contact CEO resolution flags),
-       which build_final_output.py reads to produce the actual
-       one-file deliverable with CEO T/F / Duplicate / Company
-       Structure Flag columns appended.
-    6. Send an email alert on completion, or immediately on hard failure
+       plus tier3_results.json (per-contact CEO resolution flags)
+    6. Automatically build the final one-file deliverable (every
+       original column intact, plus CEO T/F / Duplicate / Company
+       Structure Flag, email/phone reordered) and upload it back to
+       the same Google Drive folder — fully turnkey, no manual step.
+    7. Send an email alert on completion, or immediately on hard failure
+
+This final-upload step runs in a finally block so it happens whether
+the run completes fully or stops early due to Serper quota exhaustion —
+you always get a CSV out either way.
 
 Usage:
     python -m pipeline.pipeline
@@ -25,11 +30,13 @@ import asyncio
 import traceback
 import pandas as pd
 
-from pipeline.drive_fetch import fetch_all_csvs
+from pipeline.drive_fetch import fetch_all_csvs, upload_file
 from pipeline.merge_leads import merge_and_tag
 from pipeline.tier0_local_signals import run_tier0
 from pipeline.tier1_website_scrape import run_tier1_batch
 from pipeline.tier3_search_classify import submit_batch, SearchQuotaExceeded
+from pipeline.build_final_output import load_tier3_results, append_ceo_columns
+from pipeline.reorder_contacts import process_dataframe
 from pipeline.config import TIER3_TEST_LIMIT
 from pipeline.db import get_conn, upsert_company, insert_person, log_pipeline_run
 from pipeline.alerts import send_run_completed, send_run_failed, send_budget_exceeded
@@ -39,6 +46,8 @@ DATA_DIR = "data"
 RAW_DIR = os.path.join(DATA_DIR, "raw_from_drive")
 MERGED_PATH = os.path.join(DATA_DIR, "leads.csv")
 OUTPUT_DIR = "outputs"
+TIER3_RESULTS_PATH = os.path.join(OUTPUT_DIR, "tier3_results.json")
+FINAL_OUTPUT_FILENAME = "PulseTrack_Final_Leads.csv"
 
 COL_FIRST_NAME = "First Name.1"
 COL_LAST_NAME = "Last Name.1"
@@ -150,6 +159,37 @@ def write_split_outputs(tagged: pd.DataFrame, run_summary: dict):
     run_summary["needs_review_count"] = len(manual_review)
 
 
+def build_and_upload_final_csv(tagged: pd.DataFrame):
+    """
+    Builds the final one-file deliverable (every original column intact,
+    plus CEO T/F / Duplicate / Company Structure Flag, email/phone
+    reordered) directly from the in-memory tagged dataframe, then uploads
+    it to Google Drive. Runs regardless of whether Tier 3 fully completed,
+    so a partial run still produces a usable file with whatever's resolved
+    so far, blank CEO columns for anything not yet reached.
+    """
+    print("=== Building final deliverable CSV ===")
+    try:
+        df = process_dataframe(tagged.copy())
+        tier3_results = load_tier3_results(TIER3_RESULTS_PATH)
+        df = append_ceo_columns(df, tier3_results)
+
+        confirmed = (df["CEO T/F"] == "true").sum()
+        duplicates = (df["Duplicate"] == "duplicate").sum()
+        print(f"{confirmed} rows confirmed CEO T/F = true, {duplicates} rows flagged as duplicate.")
+
+        final_path = os.path.join(OUTPUT_DIR, FINAL_OUTPUT_FILENAME)
+        df.to_csv(final_path, index=False)
+        print(f"Wrote final CSV -> {final_path}")
+
+        upload_file(final_path, DRIVE_FOLDER_ID, FINAL_OUTPUT_FILENAME)
+        print(f"Uploaded final CSV to Google Drive as '{FINAL_OUTPUT_FILENAME}' in the source folder.")
+    except Exception as e:
+        # Never let the final-CSV step itself crash the whole run after
+        # everything else already succeeded — log it clearly instead.
+        print(f"WARNING: failed to build/upload final CSV: {e}")
+
+
 def main():
     run_summary = {
         "tier": "full_run",
@@ -165,6 +205,7 @@ def main():
         "people_inserted": 0,
         "companies_written_to_supabase": 0,
     }
+    tagged = None
 
     try:
         tagged = fetch_and_merge_source_data()
@@ -327,9 +368,9 @@ def main():
                 per_contact_flags = outcome["per_contact_flags"]
 
                 os.makedirs(OUTPUT_DIR, exist_ok=True)
-                with open(os.path.join(OUTPUT_DIR, "tier3_results.json"), "w") as f:
+                with open(TIER3_RESULTS_PATH, "w") as f:
                     json.dump(per_contact_flags, f)
-                print(f"Wrote Tier 3 per-contact results -> {os.path.join(OUTPUT_DIR, 'tier3_results.json')}")
+                print(f"Wrote Tier 3 per-contact results -> {TIER3_RESULTS_PATH}")
 
                 run_summary["api_calls_made"] += stats.get("api_calls_made", 0)
                 run_summary["serper_cost_usd"] += stats.get("serper_cost_usd", 0.0)
@@ -389,7 +430,7 @@ def main():
                         status="quota_exceeded",
                     )
                 send_budget_exceeded("Serper", str(e))
-                print("Run halted cleanly, everything resolved so far is saved and in Supabase.")
+                print("Run halted due to quota, building final CSV with whatever's resolved so far...")
                 return
 
         write_split_outputs(tagged, run_summary)
@@ -416,6 +457,13 @@ def main():
         print(f"=== HARD FAILURE ===\n{error_text}")
         send_run_failed(tier="full_run", error=str(e) + "\n\n" + error_text[-1000:])
         sys.exit(1)
+
+    finally:
+        # Always attempt to build and upload the final CSV, whether the
+        # run completed fully or stopped early due to quota — you get a
+        # usable file either way, no manual step required.
+        if tagged is not None:
+            build_and_upload_final_csv(tagged)
 
 
 if __name__ == "__main__":
