@@ -1,119 +1,123 @@
 """
-tier3_search_classify.py — final residual layer. For companies that Tier 0
-and Tier 1 couldn't resolve, run a real web search and hand the results to
-Claude Haiku with a strict, evidence-required classification prompt.
+tier3_search_classify.py — final residual layer. For companies where Tier 0
+found a genuine top-title conflict (2+ named people claiming the same role),
+runs a real web search for "{Company Name} CEO" and asks Claude to identify
+which named contact is the actual current leader, weighing recency so a
+stepped-down former CEO doesn't override a more recent successor. Also
+detects franchise and law-firm/membership-org structures.
 
-Search calls run concurrently (async) using ONE shared Postgres connection
-protected by an asyncio.Lock, rather than opening a new connection per
-worker per write, to protect Supabase's connection pooler at scale. Each
-result is checkpointed to Supabase (tier3_search_log) the moment it
-succeeds, so a crash or restart mid-batch does not lose already-paid-for
-search results, and a resumed run will skip any company already searched
-successfully.
+Search calls run concurrently using ONE shared Postgres connection protected
+by an asyncio.Lock. Each result is checkpointed to Supabase (tier3_search_log)
+the moment it succeeds, so a crash or restart mid-batch does not lose
+already-paid-for search results.
 
-Quota exhaustion detection: Serper does not reliably use 402/403 for an
-exhausted account, it has been observed returning a plain 400 Bad Request
-instead. So any 4xx response body is inspected for credit/quota wording
-before deciding whether it's a real bad request or a disguised quota error.
-Once quota exhaustion is confirmed, a shared stop signal halts all other
-in-flight concurrent workers immediately.
+Quota exhaustion detection: Serper has been observed returning a plain 400
+Bad Request for an exhausted account rather than 402/403, so any 4xx body
+is inspected for credit/quota wording before deciding it's a real bad
+request vs a disguised quota error. A shared stop signal halts all other
+in-flight workers once quota exhaustion is confirmed.
 
-Cost tracking: cost_usd is an ESTIMATE based on Serper's $50-per-50,000-
-credit pricing tier ($0.001/call), not a real-time billing figure from
-Serper's API, which does not return per-call cost in its response.
+Cost tracking: serper_cost_usd is an ESTIMATE ($0.001/call, based on the
+$50-per-50,000-credit tier). claude_cost_usd is REAL, calculated from the
+actual input/output token counts returned by every Claude API response
+(Haiku 4.5 rates: $1/million input tokens, $5/million output tokens).
 
-After the batch is submitted, this module polls the Anthropic Batch API
-for up to BATCH_POLL_TIMEOUT_SECONDS. If it finishes within that window,
-results are automatically applied back into Supabase via upsert_company.
-If not, the batch ID is logged clearly for manual follow-up later, since
-Batch API jobs can legitimately take hours and blocking the whole pipeline
-run indefinitely isn't realistic.
+Output per conflicted company: a list of per-contact results, each with
+ceo_tf ("true"/"false"), duplicate_flag ("duplicate" or ""), and
+structure_flag (the detected company_type). For franchises, the same
+search/resolve logic applies. For multi_partner_firm and
+membership_or_chapter_org, NO search or auto-resolution is attempted —
+those get structure_flag set and ceo_tf/duplicate_flag left blank,
+per explicit instruction to leave them for manual review.
 """
 
 import json
-import time
 import asyncio
 import httpx
 import anthropic
 from pipeline.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, SERPER_API_KEY, TIER3_BATCH_SIZE
-from pipeline.db import get_conn, log_tier3_search, get_already_searched_companies, upsert_company
+from pipeline.db import get_conn, log_tier3_search, get_already_searched_companies
 
 SYSTEM_PROMPT = """You are a careful data-classification assistant for a B2B lead database.
-You will be given a company name and a set of web search result snippets about that company.
 
-Your job: determine the company_type and whether contacts under this company name in our
-database are usable sales leads, based ONLY on the evidence in the snippets provided.
+You will be given a company name, a list of named contacts who each claim the
+same top-level title (e.g. CEO, President, Owner, Founder) at that company,
+and a set of web search result snippets about that company.
 
-STRICT RULES, do not deviate:
+Your job, in order:
 
-1. NEVER classify as "data_garbage" unless the snippets contain a concrete, checkable
-   contradiction (e.g. the company is clearly a single small business but our database
-   lists an implausible number of "C-level" contacts; or the company name doesn't match
-   any real business found in search results at all).
+1. Determine if this is a FRANCHISE location, a LAW FIRM or other
+   multi-partner professional firm, or a MEMBERSHIP/CHAPTER organization
+   (e.g. a local chapter of a national nonprofit, club, or association).
+   If it is a law firm or membership/chapter org, STOP THERE — do not
+   attempt to identify a CEO. Set company_type accordingly and leave
+   confirmed_name as null.
 
-2. If the evidence is incomplete, ambiguous, or simply insufficient to decide confidently,
-   you MUST return company_type = "needs_manual_review" with confidence below 0.5.
-   Insufficient evidence is NOT the same as data_garbage. Defaulting to data_garbage when
-   you are merely uncertain is a serious error, do not do this.
+2. If it is a standalone business or franchise location, identify which
+   ONE of the named contacts is the actual CURRENT leader (CEO, President,
+   Owner, or Founder), based ONLY on evidence in the snippets.
 
-3. Valid company_type values:
-   - standalone_business
-   - multi_partner_firm
-   - franchise_unit
-   - franchise_parent
-   - membership_or_chapter_org
-   - nonprofit_ngo
-   - acquired_inactive
-   - data_garbage
-   - needs_manual_review
+   CRITICAL: weigh recency carefully. If the snippets show a leadership
+   transition (e.g. one source says Person A was CEO, a more recent source
+   says Person A stepped down or Person B is now CEO), identify the CURRENT
+   leader as of the most recent evidence, not whoever appears first or most
+   often. If sources conflict and you cannot tell which is more recent or
+   reliable, set confidence below 0.5 and explain the conflict in evidence.
 
-4. If snippets reveal the company was acquired, set company_type = "acquired_inactive"
-   and include the acquirer's name in "evidence" if mentioned.
-
-5. Every response must include specific evidence quoted/paraphrased from the snippets,
-   never assert a fact you cannot point to in the provided text.
+3. If the evidence is insufficient to confidently identify which named
+   contact is current, you MUST set confirmed_name to null and confidence
+   below 0.5, rather than guessing. Do not default to data_garbage merely
+   for thin evidence — only use data_garbage if there is a concrete
+   contradiction (e.g. the company itself doesn't appear to exist).
 
 Respond ONLY with valid JSON, no preamble, matching this exact schema:
 {
-  "company_type": "...",
-  "usable_lead": true | false | null,
+  "company_type": "standalone_business" | "franchise_unit" | "franchise_parent" |
+                   "multi_partner_firm" | "membership_or_chapter_org" |
+                   "nonprofit_ngo" | "acquired_inactive" | "data_garbage" |
+                   "needs_manual_review",
+  "confirmed_name": "exact name as given in the candidate list" | null,
   "confidence": 0.0-1.0,
-  "evidence": "specific reasoning citing what was found in the snippets",
+  "evidence": "specific reasoning citing what was found in the snippets, including any recency/transition reasoning",
   "acquirer_name": "..." | null
 }
 """
 
 USER_TEMPLATE = """Company name: {company_name}
-Our database lists {n_contacts} contact(s) with C-level/leadership titles for this company.
+
+Named contacts claiming this same top title at this company:
+{candidate_list}
 
 Web search result snippets:
 {snippets}
 
-Classify this company per the rules above."""
+Identify the current leader per the rules above."""
 
 SEARCH_CONCURRENCY = 8
 MAX_RETRIES = 4
 SERPER_COST_PER_CALL_ESTIMATE = 0.001  # based on $50 / 50,000 credits
-BATCH_POLL_TIMEOUT_SECONDS = 600  # 10 minutes
-BATCH_POLL_INTERVAL_SECONDS = 20
+
+# Real Claude Haiku 4.5 rates, per token (not per million) — used to
+# calculate exact cost from response.usage on every call.
+CLAUDE_INPUT_COST_PER_TOKEN = 1.00 / 1_000_000
+CLAUDE_OUTPUT_COST_PER_TOKEN = 5.00 / 1_000_000
 
 QUOTA_KEYWORDS = ("credit", "quota", "insufficient", "balance", "exceeded", "out of")
+
+# These structure types get NO search, NO auto-resolution — flagged and left alone.
+NO_RESOLVE_TYPES = {"multi_partner_firm", "membership_or_chapter_org"}
 
 
 class SearchQuotaExceeded(Exception):
     """Raised when Serper confirms (via response body wording, not just
-    status code) that the account is out of credits, signals the caller
-    to stop immediately rather than keep burning calls against a dead key."""
+    status code) that the account is out of credits."""
     pass
 
 
 def is_junk_name(name: str) -> bool:
     if not name or not isinstance(name, str):
         return True
-    cleaned = name.strip()
-    if len(cleaned) < 2:
-        return True
-    return False
+    return len(name.strip()) < 2
 
 
 def looks_like_quota_error(status_code: int, body_text: str) -> bool:
@@ -125,12 +129,10 @@ def looks_like_quota_error(status_code: int, body_text: str) -> bool:
 
 async def search_company_async(client: httpx.AsyncClient, company_name: str,
                                  stop_event: asyncio.Event, call_counter: dict,
-                                 n_results: int = 5, max_retries: int = MAX_RETRIES) -> tuple[str, str]:
+                                 n_results: int = 6, max_retries: int = MAX_RETRIES) -> tuple[str, str]:
     """
-    Runs a Serper.dev Google search and returns (status, snippet_text).
-    status is "success", "failed", or "skipped_quota".
-    call_counter is a shared dict that gets incremented for every actual
-    HTTP call made, regardless of outcome, so real call counts are tracked.
+    Runs a Serper.dev search for "{company_name} CEO" and returns
+    (status, snippet_text). status is "success", "failed", or "skipped_quota".
     """
     if stop_event.is_set():
         return "skipped_quota", "(skipped: quota already confirmed exhausted by another worker)"
@@ -145,7 +147,7 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
             resp = await client.post(
                 "https://google.serper.dev/search",
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json={"q": f"{company_name} CEO owner about", "num": n_results},
+                json={"q": f"{company_name} CEO", "num": n_results},
                 timeout=20,
             )
 
@@ -172,7 +174,9 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
             for r in results[:n_results]:
                 title = r.get("title", "")
                 desc = r.get("snippet", "")
-                snippets.append(f"- {title}: {desc}")
+                date = r.get("date", "")
+                date_part = f" [{date}]" if date else ""
+                snippets.append(f"- {title}{date_part}: {desc}")
             text = "\n".join(snippets) if snippets else "(no search results found)"
             return "success", text
 
@@ -186,41 +190,103 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
     return "failed", f"(search failed after {max_retries} attempts: {last_error})"
 
 
-async def run_searches_with_checkpointing(companies: list[dict]) -> dict:
+def classify_with_claude(client: anthropic.Anthropic, company_name: str,
+                          candidate_names: list[str], snippets: str,
+                          claude_stats: dict) -> dict:
     """
-    Searches all companies concurrently using ONE shared Postgres connection
-    protected by an asyncio.Lock, rather than one connection per worker per
-    write. Returns a dict with 'results' (company name -> snippets) and
-    'stats' (real counts for success/failed/skipped_quota/total_calls/cost_usd).
+    Single synchronous Claude call. Tracks REAL token usage and cost from
+    response.usage into claude_stats (shared across all calls in this run).
+    """
+    candidate_list = "\n".join(f"- {name}" for name in candidate_names)
+    user_msg = USER_TEMPLATE.format(
+        company_name=company_name,
+        candidate_list=candidate_list,
+        snippets=snippets,
+    )
+    text = ""
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=400,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+
+        # Real token counts, not an estimate — Anthropic returns exact
+        # usage on every response.
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        call_cost = (input_tokens * CLAUDE_INPUT_COST_PER_TOKEN +
+                     output_tokens * CLAUDE_OUTPUT_COST_PER_TOKEN)
+
+        claude_stats["calls_made"] += 1
+        claude_stats["input_tokens"] += input_tokens
+        claude_stats["output_tokens"] += output_tokens
+        claude_stats["cost_usd"] += call_cost
+
+        text = response.content[0].text
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"company_type": "needs_manual_review", "confirmed_name": None,
+                 "confidence": 0.0, "evidence": f"failed_to_parse_model_output: {text[:200]}",
+                 "acquirer_name": None}
+    except Exception as e:
+        return {"company_type": "needs_manual_review", "confirmed_name": None,
+                 "confidence": 0.0, "evidence": f"claude_call_failed: {str(e)}",
+                 "acquirer_name": None}
+
+
+def build_per_contact_flags(candidate_names: list[str], classification: dict) -> dict:
+    """
+    Given the company-level classification, returns {contact_name: {ceo_tf,
+    duplicate_flag, structure_flag}} for every candidate at this company.
+    """
+    structure = classification.get("company_type", "needs_manual_review")
+    confirmed_name = classification.get("confirmed_name")
+
+    flags = {}
+    if structure in NO_RESOLVE_TYPES:
+        for name in candidate_names:
+            flags[name] = {"ceo_tf": "", "duplicate_flag": "", "structure_flag": structure}
+        return flags
+
+    if not confirmed_name:
+        for name in candidate_names:
+            flags[name] = {"ceo_tf": "", "duplicate_flag": "", "structure_flag": structure}
+        return flags
+
+    for name in candidate_names:
+        if name == confirmed_name:
+            flags[name] = {"ceo_tf": "true", "duplicate_flag": "", "structure_flag": structure}
+        else:
+            flags[name] = {"ceo_tf": "false", "duplicate_flag": "duplicate", "structure_flag": structure}
+    return flags
+
+
+async def run_conflict_resolution(companies: list[dict]) -> dict:
+    """
+    For each conflicted company (each dict must have 'name_cleaned' and
+    'candidate_names'), searches concurrently, checkpoints to Supabase,
+    classifies via Claude, and returns per-contact flags plus real
+    cost/token stats for both Serper and Claude.
     """
     shared_conn_ctx = get_conn()
     shared_conn = shared_conn_ctx.__enter__()
     conn_lock = asyncio.Lock()
 
-    try:
-        already_done = get_already_searched_companies(shared_conn)
-    finally:
-        pass  # connection stays open for the duration of this function
-
-    print(f"Found {len(already_done)} companies already searched successfully in a prior run, skipping those.")
+    already_done = get_already_searched_companies(shared_conn)
+    print(f"Found {len(already_done)} companies already searched successfully in a prior run, skipping search for those.")
 
     seen = set()
     to_search = []
     for company in companies:
         name = company["name_cleaned"]
-        if is_junk_name(name):
-            continue
-        if name in seen:
+        if is_junk_name(name) or name in seen:
             continue
         seen.add(name)
-        if name in already_done:
-            continue
         to_search.append(company)
 
-    print(f"{len(to_search)} companies need a fresh search "
-          f"(after removing junk names, duplicates, and already-searched companies).")
-
-    results = dict(already_done)
+    snippets_by_company = dict(already_done)
     semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
     stop_event = asyncio.Event()
     counters = {"success": 0, "failed": 0, "skipped_quota": 0}
@@ -229,6 +295,8 @@ async def run_searches_with_checkpointing(companies: list[dict]) -> dict:
 
     async def worker(client, company):
         name = company["name_cleaned"]
+        if name in already_done:
+            return
         async with semaphore:
             try:
                 status, snippets = await search_company_async(client, name, stop_event, call_counter)
@@ -240,14 +308,8 @@ async def run_searches_with_checkpointing(companies: list[dict]) -> dict:
             log_tier3_search(shared_conn, name, snippets, status)
             shared_conn.commit()
 
-        results[name] = snippets
+        snippets_by_company[name] = snippets
         counters[status] += 1
-        done = sum(counters.values())
-        if done % 100 == 0:
-            print(f"  Tier 3 search progress: {done}/{len(to_search)} "
-                  f"({counters['success']} ok, {counters['failed']} failed, "
-                  f"{counters['skipped_quota']} skipped_quota, "
-                  f"{call_counter['count']} real calls made)")
 
     try:
         async with httpx.AsyncClient() as client:
@@ -256,153 +318,59 @@ async def run_searches_with_checkpointing(companies: list[dict]) -> dict:
     finally:
         shared_conn_ctx.__exit__(None, None, None)
 
-    cost_usd = round(call_counter["count"] * SERPER_COST_PER_CALL_ESTIMATE, 4)
+    serper_cost_usd = round(call_counter["count"] * SERPER_COST_PER_CALL_ESTIMATE, 4)
     print(f"Tier 3 search complete: {counters['success']} succeeded, "
           f"{counters['failed']} failed, {counters['skipped_quota']} skipped due to quota. "
-          f"{call_counter['count']} real Serper calls made (~${cost_usd} estimated).")
+          f"{call_counter['count']} real Serper calls made (~${serper_cost_usd} estimated).")
 
     stats = {
         "success_count": counters["success"],
         "failed_count": counters["failed"],
         "skipped_quota_count": counters["skipped_quota"],
         "api_calls_made": call_counter["count"],
-        "cost_usd": cost_usd,
+        "serper_cost_usd": serper_cost_usd,
     }
 
     if quota_error_holder["error"] is not None:
         quota_error_holder["error"].stats = stats
         raise quota_error_holder["error"]
 
-    return {"results": results, "stats": stats}
+    # Now classify each company with Claude — real token cost tracked here.
+    claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    claude_stats = {"calls_made": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    per_contact_flags = {}
 
-
-def build_batch_requests(companies: list[dict], search_results: dict) -> list[dict]:
-    requests = []
-    seen = set()
-    for i, company in enumerate(companies):
+    for company in to_search:
         name = company["name_cleaned"]
-        if is_junk_name(name) or name in seen:
-            continue
-        seen.add(name)
-        snippets = search_results.get(name, "(no search results found)")
-        user_msg = USER_TEMPLATE.format(
-            company_name=name,
-            n_contacts=company.get("n_contacts", "unknown"),
-            snippets=snippets,
-        )
-        requests.append({
-            "custom_id": f"company-{i}-{name[:40]}",
-            "params": {
-                "model": CLAUDE_MODEL,
-                "max_tokens": 400,
-                "system": SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": user_msg}],
-            },
-        })
-    return requests
+        candidate_names = company.get("candidate_names", [])
+        snippets = snippets_by_company.get(name, "(no search results found)")
+        classification = classify_with_claude(claude_client, name, candidate_names, snippets, claude_stats)
+        per_contact_flags[name] = build_per_contact_flags(candidate_names, classification)
 
+    claude_stats["cost_usd"] = round(claude_stats["cost_usd"], 4)
+    print(f"Tier 3 classification complete: {claude_stats['calls_made']} Claude calls, "
+          f"{claude_stats['input_tokens']} input tokens, {claude_stats['output_tokens']} output tokens, "
+          f"${claude_stats['cost_usd']} real cost.")
 
-def apply_classification_to_supabase(custom_id_to_company: dict, classification: dict):
-    """
-    Writes one classified company's result into Supabase via upsert_company.
-    Raw Tier 3 findings are written as-is, not blended into a single
-    subjective judgment, per the project's standing requirement.
-    """
-    name = custom_id_to_company.get(classification["custom_id"])
-    if not name:
-        return
+    stats["claude_calls_made"] = claude_stats["calls_made"]
+    stats["claude_input_tokens"] = claude_stats["input_tokens"]
+    stats["claude_output_tokens"] = claude_stats["output_tokens"]
+    stats["claude_cost_usd"] = claude_stats["cost_usd"]
+    stats["total_cost_usd"] = round(stats["serper_cost_usd"] + claude_stats["cost_usd"], 4)
 
-    company_record = {
-        "name": name,
-        "name_cleaned": name,
-        "domain": None, "website": None, "industry": None,
-        "revenue_range": None, "staff_bucket": None,
-        "city": None, "state": None, "country": None, "description": None,
-        "company_type": classification.get("company_type", "needs_manual_review"),
-        "usable_lead": classification.get("usable_lead"),
-        "usable_lead_reason": classification.get("evidence"),
-        "classification_confidence": classification.get("confidence"),
-        "classification_source": "tier3_search_classify",
-        "classification_evidence": classification.get("evidence"),
-        "resolution_status": "auto_resolved" if classification.get("company_type") not in
-                              (None, "needs_manual_review", "data_garbage") else "needs_review",
-    }
-    with get_conn() as conn:
-        upsert_company(conn, company_record)
-
-
-def poll_and_apply_batch_results(batch_id: str, custom_id_to_company: dict) -> dict:
-    """
-    Polls the Anthropic Batch API for up to BATCH_POLL_TIMEOUT_SECONDS.
-    If the batch finishes within that window, applies every classification
-    back into Supabase and returns {"completed": True, "applied_count": N}.
-    If it times out first, returns {"completed": False, "batch_id": batch_id}
-    so the caller can log it for manual follow-up rather than blocking forever.
-    """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    elapsed = 0
-
-    while elapsed < BATCH_POLL_TIMEOUT_SECONDS:
-        batch = client.messages.batches.retrieve(batch_id)
-        if batch.processing_status == "ended":
-            applied = 0
-            for result in client.messages.batches.results(batch_id):
-                custom_id = result.custom_id
-                if result.result.type == "succeeded":
-                    text = result.result.message.content[0].text
-                    try:
-                        parsed = json.loads(text)
-                    except json.JSONDecodeError:
-                        parsed = {"company_type": "needs_manual_review", "usable_lead": None,
-                                  "confidence": 0.0,
-                                  "evidence": f"failed_to_parse_model_output: {text[:200]}"}
-                else:
-                    parsed = {"company_type": "needs_manual_review", "usable_lead": None,
-                              "confidence": 0.0,
-                              "evidence": f"batch_request_failed: {result.result.type}"}
-
-                parsed["custom_id"] = custom_id
-                apply_classification_to_supabase(custom_id_to_company, parsed)
-                applied += 1
-
-            print(f"Batch {batch_id} completed. Applied {applied} classifications to Supabase.")
-            return {"completed": True, "applied_count": applied}
-
-        time.sleep(BATCH_POLL_INTERVAL_SECONDS)
-        elapsed += BATCH_POLL_INTERVAL_SECONDS
-
-    print(f"Batch {batch_id} did not complete within {BATCH_POLL_TIMEOUT_SECONDS}s. "
-          f"It is still processing on Anthropic's side. Check back later with: "
-          f"client.messages.batches.retrieve('{batch_id}')")
-    return {"completed": False, "batch_id": batch_id}
+    return {"per_contact_flags": per_contact_flags, "stats": stats}
 
 
 def submit_batch(companies: list[dict]) -> dict:
     """
-    Runs all Tier 3 searches concurrently with checkpointing, submits a
-    batch job to the Anthropic Batch API, then attempts to poll and apply
-    results within BATCH_POLL_TIMEOUT_SECONDS. Returns a dict with the
-    batch_id, real search stats, and whether results were applied.
+    companies: list of dicts, each with 'name_cleaned' and 'candidate_names'
+    (the list of contact names claiming the conflicted top title).
+
+    Returns {"per_contact_flags": {...}, "stats": {...}} where stats now
+    includes both serper_cost_usd (estimate) and claude_cost_usd (real,
+    token-based), plus total_cost_usd.
     """
-    search_outcome = asyncio.run(run_searches_with_checkpointing(companies))
-    search_results = search_outcome["results"]
-    stats = search_outcome["stats"]
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    requests = build_batch_requests(companies, search_results)
-    custom_id_to_company = {r["custom_id"]: r["custom_id"].split("-", 2)[-1] for r in requests}
-
-    batch = client.messages.batches.create(requests=requests)
-    print(f"Submitted batch {batch.id} with {len(requests)} requests. Status: {batch.processing_status}")
-
-    batch_outcome = poll_and_apply_batch_results(batch.id, custom_id_to_company)
-
-    return {
-        "batch_id": batch.id,
-        "stats": stats,
-        "batch_completed": batch_outcome["completed"],
-        "batch_applied_count": batch_outcome.get("applied_count", 0),
-    }
+    return asyncio.run(run_conflict_resolution(companies))
 
 
 if __name__ == "__main__":
@@ -413,13 +381,9 @@ if __name__ == "__main__":
     df = pd.read_csv(tier1_path)
     residual = df[df["resolution"].isin(["unresolved_tier1", "ambiguous_tier1"])]
 
-    print(f"Submitting {len(residual)} companies to Tier 3 (search + Claude Haiku batch)...")
+    print(f"Resolving {len(residual)} conflicted companies via Tier 3 search...")
     companies = residual.to_dict("records")
 
     outcome = submit_batch(companies)
-    print(f"Batch submitted: {outcome['batch_id']}")
-    print(f"Search stats: {outcome['stats']}")
-    if outcome["batch_completed"]:
-        print(f"Applied {outcome['batch_applied_count']} classifications to Supabase already.")
-    else:
-        print("Batch still processing, check back later.")
+    print(f"Stats: {outcome['stats']}")
+    print(f"Resolved {len(outcome['per_contact_flags'])} companies.")

@@ -4,11 +4,16 @@ pipeline.py - orchestrates the full PulseTrack run:
     1. Pull all source CSVs from the shared Google Drive folder
     2. Merge them into one dataframe, tagging conflicts (nothing deleted)
     3. Run Tier 0 -> Tier 1 -> Tier 3 exactly as before
-    4. Write EVERY company into Supabase (not just auto-resolved ones),
-       tagged with its current resolution_status, so Supabase becomes
-       the single durable source of truth for the entire dataset
+    4. Write EVERY company into Supabase, tagged with its current
+       resolution_status, so Supabase becomes the single durable
+       source of truth for the entire dataset
     5. Write three local CSVs: leads / manual_review / run_summary
     6. Send an email alert on completion, or immediately on hard failure
+
+Tier 3 now resolves genuine CEO conflicts by name (ceo_tf/duplicate_flag/
+structure_flag per contact) rather than a blanket company-level batch
+classification. Results are merged into Supabase company records and
+also kept in run_summary for the final CSV build step (build_final_output.py).
 
 Usage:
     python -m pipeline.pipeline
@@ -154,6 +159,8 @@ def main():
         "failed_count": 0,
         "rate_limited_count": 0,
         "api_calls_made": 0,
+        "serper_cost_usd": 0.0,
+        "claude_cost_usd": 0.0,
         "cost_usd": 0.0,
         "people_inserted": 0,
         "companies_written_to_supabase": 0,
@@ -164,7 +171,7 @@ def main():
         raw_df = pd.read_csv(MERGED_PATH, dtype=str, low_memory=False)
 
         print(f"=== TIER 0: local signal resolution on {MERGED_PATH} ===")
-        tier0_results = run_tier0(MERGED_PATH)
+        tier0_results = run_tier0(tagged)
         print(tier0_results["resolution_status"].value_counts())
 
         auto_resolved = tier0_results[tier0_results["resolution_status"] == "auto_resolved"]
@@ -285,7 +292,7 @@ def main():
                                   cost_usd=0.0, api_calls_made=0)
 
             print(f"Tier 1 resolved {len(resolved_tier1)} / {len(tier1_df)}. "
-                  f"{len(residual)} pass to Tier 3 (search + Claude batch). All written to Supabase.")
+                  f"{len(residual)} pass to Tier 3 (CEO conflict resolution). All written to Supabase.")
 
         if len(residual) > 0:
             residual_companies = residual.to_dict("records")
@@ -299,6 +306,10 @@ def main():
                 if name in seen_names:
                     continue
                 seen_names.add(name)
+                # candidate_names must already be on each record from Tier 1's
+                # companies_to_check list above (it's carried through tier1_results)
+                if "candidate_names" not in c:
+                    c["candidate_names"] = []
                 deduped.append(c)
             dropped = len(residual_companies) - len(deduped)
             if dropped > 0:
@@ -310,36 +321,61 @@ def main():
                 print(f"=== TIER 3 TEST MODE: limiting to first {len(residual_companies)} "
                       f"of {len(residual)} companies (TIER3_TEST_LIMIT set) ===")
             else:
-                print(f"=== TIER 3: submitting {len(residual_companies)} companies to search + Claude batch ===")
+                print(f"=== TIER 3: resolving CEO conflicts for {len(residual_companies)} companies ===")
 
             try:
                 outcome = submit_batch(residual_companies)
                 stats = outcome["stats"]
+                per_contact_flags = outcome["per_contact_flags"]
 
-                run_summary["api_calls_made"] += stats["api_calls_made"]
-                run_summary["cost_usd"] += stats["cost_usd"]
-                run_summary["failed_count"] += stats["failed_count"]
+                run_summary["api_calls_made"] += stats.get("api_calls_made", 0)
+                run_summary["serper_cost_usd"] += stats.get("serper_cost_usd", 0.0)
+                run_summary["claude_cost_usd"] += stats.get("claude_cost_usd", 0.0)
+                run_summary["cost_usd"] += stats.get("total_cost_usd", 0.0)
+                run_summary["failed_count"] += stats.get("failed_count", 0)
                 run_summary["needs_review_count"] += len(residual_companies)
 
-                print(f"Tier 3 batch submitted: {outcome['batch_id']}")
-                if outcome["batch_completed"]:
-                    print(f"Batch completed within the polling window, "
-                          f"{outcome['batch_applied_count']} classifications applied to Supabase.")
-                else:
-                    print(f"Batch still processing on Anthropic's side. "
-                          f"Batch ID logged for manual follow-up: {outcome['batch_id']}")
+                # Write company-level structure_flag results into Supabase
+                # (per-contact ceo_tf/duplicate_flag get applied at the
+                # final CSV build step, not stored as separate DB columns,
+                # per the decision to keep one CSV as the real deliverable)
+                with get_conn() as conn:
+                    for company_name, contact_flags in per_contact_flags.items():
+                        if not contact_flags:
+                            continue
+                        first_flags = next(iter(contact_flags.values()))
+                        structure = first_flags.get("structure_flag", "")
+                        company_record = {
+                            "name": company_name, "name_cleaned": company_name,
+                            "domain": None, "website": None, "industry": None,
+                            "revenue_range": None, "staff_bucket": None,
+                            "city": None, "state": None, "country": None, "description": None,
+                            "company_type": structure or "needs_manual_review",
+                            "usable_lead": structure not in ("multi_partner_firm",),
+                            "usable_lead_reason": "resolved via Tier 3 name-specific CEO search",
+                            "classification_confidence": None,
+                            "classification_source": "tier3_search_classify",
+                            "classification_evidence": str(contact_flags),
+                            "resolution_status": "auto_resolved",
+                        }
+                        upsert_company(conn, company_record)
+
+                print(f"Tier 3 resolved {len(per_contact_flags)} companies. "
+                      f"Serper: ${stats.get('serper_cost_usd', 0.0)} (estimate), "
+                      f"Claude: ${stats.get('claude_cost_usd', 0.0)} (real). "
+                      f"Total: ${stats.get('total_cost_usd', 0.0)}.")
 
             except SearchQuotaExceeded as e:
                 stats = getattr(e, "stats", {})
                 run_summary["api_calls_made"] += stats.get("api_calls_made", 0)
-                run_summary["cost_usd"] += stats.get("cost_usd", 0.0)
+                run_summary["serper_cost_usd"] += stats.get("serper_cost_usd", 0.0)
+                run_summary["cost_usd"] += stats.get("serper_cost_usd", 0.0)
                 run_summary["failed_count"] += stats.get("failed_count", 0)
 
                 print(f"=== SERPER QUOTA/RATE LIMIT EXCEEDED - stopping Tier 3 ===\n{e}")
                 print("Note: any companies already searched successfully before this error "
                       "are checkpointed in Supabase (tier3_search_log) and will be skipped, "
-                      "not re-paid for, on the next run. All companies remain visible in "
-                      "the companies table tagged pending_tier3 either way.")
+                      "not re-paid for, on the next run.")
                 run_summary["needs_review_count"] += len(residual_companies)
                 write_split_outputs(tagged, run_summary)
                 with get_conn() as conn:
@@ -373,7 +409,8 @@ def main():
         send_run_completed(run_summary)
         print(f"=== Run complete. {run_summary['people_inserted']} people inserted. "
               f"{run_summary['companies_written_to_supabase']} companies written to Supabase. "
-              f"${run_summary['cost_usd']} estimated Tier 3 spend. ===")
+              f"${run_summary['cost_usd']} total estimated/real spend "
+              f"(Serper ~${run_summary['serper_cost_usd']}, Claude ${run_summary['claude_cost_usd']} real). ===")
 
     except Exception as e:
         error_text = traceback.format_exc()

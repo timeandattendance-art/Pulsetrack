@@ -1,14 +1,29 @@
 """
 tier0_local_signals.py — free, local-only company/person resolution.
 
-Uses only signals already present in the source data:
-  1. Contact count vs. staff-bucket ceiling -> data_garbage (evidence: impossible headcount)
-  2. Explicit Job Change Type flag (New Hire / New Promotion) -> resolves which contact is current
-  3. Franchise / multi-partner-firm / membership-org keyword detection on title text
+Now takes the already-merged, already-tagged dataframe from merge_leads.py
+(specifically its true_conflict column) instead of re-reading the raw CSV,
+so duplicate detection is precise: true_conflict only fires when 2+ distinct
+people claim the same singular top title at one company, not just "more
+than one contact."
 
-Every resolution carries a confidence score and an evidence string. Nothing is
-flagged data_garbage or auto-resolved without a concrete, checkable trigger —
-"insufficient evidence" always falls through to needs_review, never to a guess.
+New output columns used for the final deliverable:
+    CEO T/F               — "true" for the confirmed real lead, "false" for
+                             a duplicate claimant once Tier 3 confirms who's
+                             real, blank only while still pending Tier 3
+    Duplicate              — "duplicate" on the false rows, blank otherwise
+    Company Structure Flag — the company_type value, surfaced so franchises
+                             and law-firm/multi-partner companies are visible
+
+CEO T/F only applies to rows whose title_type is "singular_top" (the actual
+CEO/Owner/President/Founder claimants). Other staff at the same company are
+not part of the conflict and are left blank, since they were never claiming
+the role being disputed.
+
+If true_conflict is False for a company, its singular_top row (there's only
+one) is auto-confirmed instantly: CEO T/F = true, no search needed.
+If true_conflict is True, CEO T/F stays blank here on purpose — Tier 3 is
+responsible for searching and filling in which claimant is real.
 """
 
 import re
@@ -20,6 +35,8 @@ FRANCHISE_KEYWORDS = re.compile(r"franchise", re.IGNORECASE)
 LAW_FIRM_NAME_PATTERN = re.compile(r"llp|llc|& associates|law office|law firm", re.IGNORECASE)
 LAW_FIRM_TITLE_PATTERN = re.compile(r"partner|lawyer|counsel", re.IGNORECASE)
 ORG_NAME_PATTERN = re.compile(r"chapter|fbla|deca|association|network|society", re.IGNORECASE)
+
+NAME_COL = "Company Name - Cleaned"
 
 
 def parse_tenure_months(value):
@@ -41,12 +58,14 @@ def parse_tenure_months(value):
 def classify_company_group(name: str, group: pd.DataFrame) -> dict:
     """
     Runs the full Tier-0 rule set against all contact rows for one company.
-    Returns a dict ready to merge into the companies table record.
+    Uses the true_conflict column already computed by merge_and_tag to
+    decide whether this company needs Tier 3 or can be auto-confirmed now.
     """
     n_contacts = len(group)
     staff_bucket = pd.to_numeric(group.get("Company Staff Count"), errors="coerce").iloc[0] \
         if "Company Staff Count" in group.columns else np.nan
     titles_lower = group.get("Title", pd.Series(dtype=str)).fillna("").str.lower()
+    has_true_conflict = bool(group.get("true_conflict", pd.Series([False])).any())
 
     # --- Trigger 1: impossible headcount (evidence-based data_garbage) ---
     if pd.notna(staff_bucket) and n_contacts > staff_bucket:
@@ -58,10 +77,14 @@ def classify_company_group(name: str, group: pd.DataFrame) -> dict:
             "classification_source": "tier0_signal",
             "classification_evidence": "contact_count_exceeds_staff_bucket_ceiling",
             "resolution_status": "auto_resolved",
+            "ceo_tf": "", "duplicate_flag": "", "structure_flag": "data_garbage",
         }
 
     # --- Trigger 2: franchise keyword in title text ---
+    # Franchises still get resolved/searched if there's a real conflict,
+    # just tagged "franchise_unit" so it's visible in Company Structure Flag.
     if titles_lower.str.contains(FRANCHISE_KEYWORDS).any():
+        ceo_tf = "true" if not has_true_conflict else ""
         return {
             "company_type": "franchise_unit",
             "usable_lead": True,
@@ -69,10 +92,13 @@ def classify_company_group(name: str, group: pd.DataFrame) -> dict:
             "classification_confidence": 0.75,
             "classification_source": "tier0_signal",
             "classification_evidence": "franchise_keyword_in_title",
-            "resolution_status": "auto_resolved",
+            "resolution_status": "auto_resolved" if not has_true_conflict else "needs_review",
+            "ceo_tf": ceo_tf, "duplicate_flag": "", "structure_flag": "franchise_unit",
         }
 
     # --- Trigger 3: multi-partner firm (law-firm-shaped name + partner-type titles) ---
+    # Per explicit instruction: never auto-resolve or search these, just flag
+    # and leave CEO T/F and Duplicate blank for manual review.
     if LAW_FIRM_NAME_PATTERN.search(name or "") and titles_lower.str.contains(LAW_FIRM_TITLE_PATTERN).any():
         return {
             "company_type": "multi_partner_firm",
@@ -82,9 +108,11 @@ def classify_company_group(name: str, group: pd.DataFrame) -> dict:
             "classification_source": "tier0_signal",
             "classification_evidence": "law_firm_name_and_partner_titles",
             "resolution_status": "auto_resolved",
+            "ceo_tf": "", "duplicate_flag": "", "structure_flag": "multi_partner_firm",
         }
 
     # --- Trigger 4: membership / chapter org ---
+    # Same as law firms: flag only, no auto-resolve, no search.
     if ORG_NAME_PATTERN.search(name or ""):
         return {
             "company_type": "membership_or_chapter_org",
@@ -94,10 +122,11 @@ def classify_company_group(name: str, group: pd.DataFrame) -> dict:
             "classification_source": "tier0_signal",
             "classification_evidence": "org_name_keyword_match",
             "resolution_status": "auto_resolved",
+            "ceo_tf": "", "duplicate_flag": "", "structure_flag": "membership_or_chapter_org",
         }
 
     # --- Trigger 5: explicit job change event resolves which contact is current ---
-    if n_contacts > 1 and "Job Change Type" in group.columns:
+    if has_true_conflict and "Job Change Type" in group.columns:
         changers = group[group["Job Change Type"].isin(["New Hire", "New Promotion"])]
         if len(changers) == 1:
             return {
@@ -109,39 +138,46 @@ def classify_company_group(name: str, group: pd.DataFrame) -> dict:
                 "classification_evidence": f"job_change_event:{changers.iloc[0]['Contact Full Name']}",
                 "resolution_status": "auto_resolved",
                 "_current_contact_name": changers.iloc[0]["Contact Full Name"],
+                "ceo_tf": "true", "duplicate_flag": "", "structure_flag": "standalone_business",
             }
 
-    # --- No reliable free signal found: explicitly fall through, do not guess ---
-    if n_contacts == 1:
+    # --- No genuine conflict: auto-confirm instantly, no search needed ---
+    if not has_true_conflict:
         return {
             "company_type": "standalone_business",
             "usable_lead": True,
-            "usable_lead_reason": "single contact, no ambiguity",
+            "usable_lead_reason": "no genuine top-title conflict, auto-confirmed",
             "classification_confidence": 0.9,
             "classification_source": "tier0_signal",
-            "classification_evidence": "single_contact_no_conflict",
+            "classification_evidence": "no_true_conflict",
             "resolution_status": "auto_resolved",
+            "ceo_tf": "true", "duplicate_flag": "", "structure_flag": "standalone_business",
         }
 
+    # --- Genuine duplicate situation, no free signal resolves it: send to Tier 3 ---
+    # CEO T/F and Duplicate stay blank here on purpose — Tier 3 fills them in
+    # once it searches and confirms who the real CEO is among these contacts.
     return {
         "company_type": "unresolved",
         "usable_lead": None,
-        "usable_lead_reason": "multiple contacts, no reliable free signal to resolve",
+        "usable_lead_reason": "multiple distinct people claiming the same top title — needs Tier 3 search",
         "classification_confidence": 0.0,
         "classification_source": "tier0_signal",
-        "classification_evidence": "no_reliable_signal",
+        "classification_evidence": "true_conflict",
         "resolution_status": "needs_review",
+        "ceo_tf": "", "duplicate_flag": "", "structure_flag": "",
     }
 
 
-def run_tier0(csv_path: str, name_col: str = "Company Name - Cleaned") -> pd.DataFrame:
+def run_tier0(tagged_df: pd.DataFrame, name_col: str = NAME_COL) -> pd.DataFrame:
     """
-    Loads the raw CSV and runs Tier-0 classification on every company group.
-    Returns a DataFrame, one row per company, ready for DB upsert.
+    Takes the already-merged, already-tagged dataframe (from merge_and_tag,
+    which includes the true_conflict column) and runs Tier-0 classification
+    on every company group. Returns a DataFrame, one row per company,
+    ready for DB upsert.
     """
-    df = pd.read_csv(csv_path, dtype=str, low_memory=False)
     results = []
-    for name, group in df.groupby(name_col):
+    for name, group in tagged_df.groupby(name_col):
         result = classify_company_group(name, group)
         result["name"] = name
         result["name_cleaned"] = name
@@ -152,9 +188,12 @@ def run_tier0(csv_path: str, name_col: str = "Company Name - Cleaned") -> pd.Dat
 
 if __name__ == "__main__":
     import sys
+    from pipeline.merge_leads import merge_and_tag
     path = sys.argv[1] if len(sys.argv) > 1 else "data/leads.csv"
-    out = run_tier0(path)
+    tagged = merge_and_tag([path])
+    out = run_tier0(tagged)
     print(out["company_type"].value_counts())
     print(out["resolution_status"].value_counts())
+    print(out["ceo_tf"].value_counts())
     out.to_csv("tier0_output.csv", index=False)
     print("Written to tier0_output.csv")
