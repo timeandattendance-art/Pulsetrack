@@ -11,8 +11,11 @@ pipeline.py - orchestrates the full PulseTrack run:
        plus tier3_results.json (per-contact CEO resolution flags)
     6. Automatically build the final one-file deliverable (every
        original column intact, plus CEO T/F / Duplicate / Company
-       Structure Flag, email/phone reordered) and upload it back to
-       the same Google Drive folder — fully turnkey, no manual step.
+       Structure Flag, email/phone reordered) and upload it to a
+       SEPARATE output Google Drive folder — fully turnkey, no manual
+       step. This is a different folder than the source CSV folder,
+       so the source-fetch step never sees or tries to parse the
+       output file.
     7. Send an email alert on completion, or immediately on hard failure
 
 This final-upload step runs in a finally block so it happens whether
@@ -42,6 +45,7 @@ from pipeline.db import get_conn, upsert_company, insert_person, log_pipeline_ru
 from pipeline.alerts import send_run_completed, send_run_failed, send_budget_exceeded
 
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
+OUTPUT_FOLDER_ID = os.environ.get("OUTPUT_FOLDER_ID")
 DATA_DIR = "data"
 RAW_DIR = os.path.join(DATA_DIR, "raw_from_drive")
 MERGED_PATH = os.path.join(DATA_DIR, "leads.csv")
@@ -164,7 +168,8 @@ def build_and_upload_final_csv(tagged: pd.DataFrame):
     Builds the final one-file deliverable (every original column intact,
     plus CEO T/F / Duplicate / Company Structure Flag, email/phone
     reordered) directly from the in-memory tagged dataframe, then uploads
-    it to Google Drive. Runs regardless of whether Tier 3 fully completed,
+    it to a SEPARATE output Drive folder (OUTPUT_FOLDER_ID), not the
+    source CSV folder. Runs regardless of whether Tier 3 fully completed,
     so a partial run still produces a usable file with whatever's resolved
     so far, blank CEO columns for anything not yet reached.
     """
@@ -182,8 +187,12 @@ def build_and_upload_final_csv(tagged: pd.DataFrame):
         df.to_csv(final_path, index=False)
         print(f"Wrote final CSV -> {final_path}")
 
-        upload_file(final_path, DRIVE_FOLDER_ID, FINAL_OUTPUT_FILENAME)
-        print(f"Uploaded final CSV to Google Drive as '{FINAL_OUTPUT_FILENAME}' in the source folder.")
+        if not OUTPUT_FOLDER_ID:
+            print("WARNING: OUTPUT_FOLDER_ID not set, skipping Drive upload.")
+            return
+
+        upload_file(final_path, OUTPUT_FOLDER_ID, FINAL_OUTPUT_FILENAME)
+        print(f"Uploaded final CSV to Google Drive as '{FINAL_OUTPUT_FILENAME}' in the output folder.")
     except Exception as e:
         # Never let the final-CSV step itself crash the whole run after
         # everything else already succeeded — log it clearly instead.
