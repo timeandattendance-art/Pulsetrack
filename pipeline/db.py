@@ -3,12 +3,41 @@ db.py — thin Postgres helper layer over the Supabase database.
 
 Uses psycopg2 directly rather than an ORM, since the pipeline mostly does
 batch upserts and simple lookups. Kept deliberately simple.
+
+sanitize_value() converts pandas/numpy NaN, NaT, and None-like values into
+a real Python None before anything reaches a SQL query. Without this,
+pandas NaN (a float) gets passed to psycopg2 and Postgres rejects it when
+compared against a text column (e.g. "operator does not exist: text =
+double precision"), which crashed a real run on the domain field.
 """
 
+import math
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
 from pipeline.config import SUPABASE_DB_URL
+
+
+def sanitize_value(val):
+    """Converts NaN/NaT/pandas-missing values to None. Passes everything
+    else through unchanged."""
+    if val is None:
+        return None
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    try:
+        import pandas as pd
+        if pd.isna(val):
+            return None
+    except (ImportError, TypeError, ValueError):
+        pass
+    return val
+
+
+def sanitize_record(record: dict) -> dict:
+    """Applies sanitize_value to every value in a dict, used right before
+    any insert/update so NaN never reaches a SQL query."""
+    return {k: sanitize_value(v) for k, v in record.items()}
 
 
 @contextmanager
@@ -28,6 +57,7 @@ def upsert_company(conn, company: dict) -> str:
     """
     Insert or update a company by (name_cleaned, domain). Returns the company id.
     """
+    company = sanitize_record(company)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
         """
@@ -90,6 +120,7 @@ def upsert_company(conn, company: dict) -> str:
 
 
 def insert_person(conn, person: dict):
+    person = sanitize_record(person)
     cur = conn.cursor()
     cur.execute(
         """
