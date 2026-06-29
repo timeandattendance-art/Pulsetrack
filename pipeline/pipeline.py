@@ -7,13 +7,12 @@ pipeline.py - orchestrates the full PulseTrack run:
     4. Write EVERY company into Supabase, tagged with its current
        resolution_status, so Supabase becomes the single durable
        source of truth for the entire dataset
-    5. Write three local CSVs: leads / manual_review / run_summary
+    5. Write three local CSVs: leads / manual_review / run_summary,
+       plus tier3_results.json (per-contact CEO resolution flags),
+       which build_final_output.py reads to produce the actual
+       one-file deliverable with CEO T/F / Duplicate / Company
+       Structure Flag columns appended.
     6. Send an email alert on completion, or immediately on hard failure
-
-Tier 3 now resolves genuine CEO conflicts by name (ceo_tf/duplicate_flag/
-structure_flag per contact) rather than a blanket company-level batch
-classification. Results are merged into Supabase company records and
-also kept in run_summary for the final CSV build step (build_final_output.py).
 
 Usage:
     python -m pipeline.pipeline
@@ -21,6 +20,7 @@ Usage:
 
 import os
 import sys
+import json
 import asyncio
 import traceback
 import pandas as pd
@@ -306,8 +306,6 @@ def main():
                 if name in seen_names:
                     continue
                 seen_names.add(name)
-                # candidate_names must already be on each record from Tier 1's
-                # companies_to_check list above (it's carried through tier1_results)
                 if "candidate_names" not in c:
                     c["candidate_names"] = []
                 deduped.append(c)
@@ -328,6 +326,11 @@ def main():
                 stats = outcome["stats"]
                 per_contact_flags = outcome["per_contact_flags"]
 
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                with open(os.path.join(OUTPUT_DIR, "tier3_results.json"), "w") as f:
+                    json.dump(per_contact_flags, f)
+                print(f"Wrote Tier 3 per-contact results -> {os.path.join(OUTPUT_DIR, 'tier3_results.json')}")
+
                 run_summary["api_calls_made"] += stats.get("api_calls_made", 0)
                 run_summary["serper_cost_usd"] += stats.get("serper_cost_usd", 0.0)
                 run_summary["claude_cost_usd"] += stats.get("claude_cost_usd", 0.0)
@@ -335,10 +338,6 @@ def main():
                 run_summary["failed_count"] += stats.get("failed_count", 0)
                 run_summary["needs_review_count"] += len(residual_companies)
 
-                # Write company-level structure_flag results into Supabase
-                # (per-contact ceo_tf/duplicate_flag get applied at the
-                # final CSV build step, not stored as separate DB columns,
-                # per the decision to keep one CSV as the real deliverable)
                 with get_conn() as conn:
                     for company_name, contact_flags in per_contact_flags.items():
                         if not contact_flags:
