@@ -3,29 +3,40 @@ tier3_search_classify.py — final residual layer. For companies that Tier 0
 and Tier 1 couldn't resolve, run a real web search and hand the results to
 Claude Haiku with a strict, evidence-required classification prompt.
 
-Search calls run concurrently (async) and each result is checkpointed to
-Supabase (tier3_search_log) the moment it succeeds. This means a crash or
-restart mid-batch does not lose already-paid-for search results, and a
-resumed run will skip any company already searched successfully.
+Search calls run concurrently (async) using ONE shared Postgres connection
+protected by an asyncio.Lock, rather than opening a new connection per
+worker per write, to protect Supabase's connection pooler at scale. Each
+result is checkpointed to Supabase (tier3_search_log) the moment it
+succeeds, so a crash or restart mid-batch does not lose already-paid-for
+search results, and a resumed run will skip any company already searched
+successfully.
 
 Quota exhaustion detection: Serper does not reliably use 402/403 for an
 exhausted account, it has been observed returning a plain 400 Bad Request
 instead. So any 4xx response body is inspected for credit/quota wording
 before deciding whether it's a real bad request or a disguised quota error.
 Once quota exhaustion is confirmed, a shared stop signal halts all other
-in-flight concurrent workers immediately, so we don't keep burning failed
-calls against a dead key while the exception propagates.
+in-flight concurrent workers immediately.
 
-Uses the Anthropic Batch API (50% cheaper, async) since none of this needs
-to be real-time, it's a queue of leftover ambiguous companies.
+Cost tracking: cost_usd is an ESTIMATE based on Serper's $50-per-50,000-
+credit pricing tier ($0.001/call), not a real-time billing figure from
+Serper's API, which does not return per-call cost in its response.
+
+After the batch is submitted, this module polls the Anthropic Batch API
+for up to BATCH_POLL_TIMEOUT_SECONDS. If it finishes within that window,
+results are automatically applied back into Supabase via upsert_company.
+If not, the batch ID is logged clearly for manual follow-up later, since
+Batch API jobs can legitimately take hours and blocking the whole pipeline
+run indefinitely isn't realistic.
 """
 
 import json
+import time
 import asyncio
 import httpx
 import anthropic
 from pipeline.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, SERPER_API_KEY, TIER3_BATCH_SIZE
-from pipeline.db import get_conn, log_tier3_search, get_already_searched_companies
+from pipeline.db import get_conn, log_tier3_search, get_already_searched_companies, upsert_company
 
 SYSTEM_PROMPT = """You are a careful data-classification assistant for a B2B lead database.
 You will be given a company name and a set of web search result snippets about that company.
@@ -82,9 +93,10 @@ Classify this company per the rules above."""
 
 SEARCH_CONCURRENCY = 8
 MAX_RETRIES = 4
+SERPER_COST_PER_CALL_ESTIMATE = 0.001  # based on $50 / 50,000 credits
+BATCH_POLL_TIMEOUT_SECONDS = 600  # 10 minutes
+BATCH_POLL_INTERVAL_SECONDS = 20
 
-# Wording that, if found in a 4xx response body, confirms the account is
-# actually out of credits rather than the request itself being malformed.
 QUOTA_KEYWORDS = ("credit", "quota", "insufficient", "balance", "exceeded", "out of")
 
 
@@ -105,11 +117,6 @@ def is_junk_name(name: str) -> bool:
 
 
 def looks_like_quota_error(status_code: int, body_text: str) -> bool:
-    """
-    Serper has been observed returning a plain 400 for an exhausted account
-    rather than 402/403. So any 4xx gets its body checked for quota wording
-    before we decide it's a real bad request vs a disguised quota error.
-    """
     if status_code not in (400, 401, 402, 403):
         return False
     lowered = (body_text or "").lower()
@@ -117,19 +124,13 @@ def looks_like_quota_error(status_code: int, body_text: str) -> bool:
 
 
 async def search_company_async(client: httpx.AsyncClient, company_name: str,
-                                 stop_event: asyncio.Event,
+                                 stop_event: asyncio.Event, call_counter: dict,
                                  n_results: int = 5, max_retries: int = MAX_RETRIES) -> tuple[str, str]:
     """
     Runs a Serper.dev Google search and returns (status, snippet_text).
     status is "success", "failed", or "skipped_quota".
-
-    Checks stop_event before and during retries, if another concurrent
-    worker has already confirmed quota exhaustion, this stops immediately
-    rather than burning further retries against a dead key.
-
-    Raises SearchQuotaExceeded if THIS call is the one that confirms quota
-    exhaustion (via response body wording), which also sets stop_event so
-    every other in-flight worker stops too.
+    call_counter is a shared dict that gets incremented for every actual
+    HTTP call made, regardless of outcome, so real call counts are tracked.
     """
     if stop_event.is_set():
         return "skipped_quota", "(skipped: quota already confirmed exhausted by another worker)"
@@ -140,6 +141,7 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
             return "skipped_quota", "(skipped mid-retry: quota confirmed exhausted by another worker)"
 
         try:
+            call_counter["count"] += 1
             resp = await client.post(
                 "https://google.serper.dev/search",
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
@@ -159,7 +161,6 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
                     last_error = f"429 rate-limited on attempt {attempt + 1}/{max_retries}, body: {body_text}"
                     await asyncio.sleep(2 ** attempt)
                     continue
-                # Genuine 4xx that isn't a quota signal, e.g. a real bad request
                 last_error = f"HTTP {resp.status_code} (non-quota), body: {body_text}"
                 await asyncio.sleep(2 ** attempt)
                 continue
@@ -187,18 +188,19 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
 
 async def run_searches_with_checkpointing(companies: list[dict]) -> dict:
     """
-    Searches all companies concurrently, skipping any already searched
-    successfully in a prior run, and checkpoints each result to Supabase
-    immediately as it completes. Returns {company_name: snippets} for all
-    companies, combining cached results with newly searched ones.
-
-    If quota exhaustion is confirmed mid-run, all remaining un-started
-    companies are checkpointed as "skipped_quota" rather than burned
-    through with retries, and SearchQuotaExceeded is raised once all
-    in-flight workers have wound down.
+    Searches all companies concurrently using ONE shared Postgres connection
+    protected by an asyncio.Lock, rather than one connection per worker per
+    write. Returns a dict with 'results' (company name -> snippets) and
+    'stats' (real counts for success/failed/skipped_quota/total_calls/cost_usd).
     """
-    with get_conn() as conn:
-        already_done = get_already_searched_companies(conn)
+    shared_conn_ctx = get_conn()
+    shared_conn = shared_conn_ctx.__enter__()
+    conn_lock = asyncio.Lock()
+
+    try:
+        already_done = get_already_searched_companies(shared_conn)
+    finally:
+        pass  # connection stays open for the duration of this function
 
     print(f"Found {len(already_done)} companies already searched successfully in a prior run, skipping those.")
 
@@ -222,45 +224,59 @@ async def run_searches_with_checkpointing(companies: list[dict]) -> dict:
     semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
     stop_event = asyncio.Event()
     counters = {"success": 0, "failed": 0, "skipped_quota": 0}
+    call_counter = {"count": 0}
     quota_error_holder = {"error": None}
 
     async def worker(client, company):
         name = company["name_cleaned"]
         async with semaphore:
             try:
-                status, snippets = await search_company_async(client, name, stop_event)
+                status, snippets = await search_company_async(client, name, stop_event, call_counter)
             except SearchQuotaExceeded as e:
                 quota_error_holder["error"] = e
                 status, snippets = "skipped_quota", str(e)
-        with get_conn() as conn:
-            log_tier3_search(conn, name, snippets, status)
+
+        async with conn_lock:
+            log_tier3_search(shared_conn, name, snippets, status)
+            shared_conn.commit()
+
         results[name] = snippets
         counters[status] += 1
         done = sum(counters.values())
         if done % 100 == 0:
             print(f"  Tier 3 search progress: {done}/{len(to_search)} "
                   f"({counters['success']} ok, {counters['failed']} failed, "
-                  f"{counters['skipped_quota']} skipped_quota)")
+                  f"{counters['skipped_quota']} skipped_quota, "
+                  f"{call_counter['count']} real calls made)")
 
-    async with httpx.AsyncClient() as client:
-        tasks = [worker(client, c) for c in to_search]
-        await asyncio.gather(*tasks)
+    try:
+        async with httpx.AsyncClient() as client:
+            tasks = [worker(client, c) for c in to_search]
+            await asyncio.gather(*tasks)
+    finally:
+        shared_conn_ctx.__exit__(None, None, None)
 
+    cost_usd = round(call_counter["count"] * SERPER_COST_PER_CALL_ESTIMATE, 4)
     print(f"Tier 3 search complete: {counters['success']} succeeded, "
-          f"{counters['failed']} failed, {counters['skipped_quota']} skipped due to quota.")
+          f"{counters['failed']} failed, {counters['skipped_quota']} skipped due to quota. "
+          f"{call_counter['count']} real Serper calls made (~${cost_usd} estimated).")
+
+    stats = {
+        "success_count": counters["success"],
+        "failed_count": counters["failed"],
+        "skipped_quota_count": counters["skipped_quota"],
+        "api_calls_made": call_counter["count"],
+        "cost_usd": cost_usd,
+    }
 
     if quota_error_holder["error"] is not None:
+        quota_error_holder["error"].stats = stats
         raise quota_error_holder["error"]
 
-    return results
+    return {"results": results, "stats": stats}
 
 
 def build_batch_requests(companies: list[dict], search_results: dict) -> list[dict]:
-    """
-    companies: list of dicts with 'name_cleaned' and 'n_contacts'
-    search_results: {name_cleaned: snippets} already gathered
-    Returns a list of Anthropic Message Batches API request objects.
-    """
     requests = []
     seen = set()
     for i, company in enumerate(companies):
@@ -286,49 +302,107 @@ def build_batch_requests(companies: list[dict], search_results: dict) -> list[di
     return requests
 
 
-def submit_batch(companies: list[dict]):
+def apply_classification_to_supabase(custom_id_to_company: dict, classification: dict):
     """
-    Runs all Tier 3 searches concurrently with checkpointing, then submits
-    a batch job to the Anthropic Batch API. Returns the batch id.
+    Writes one classified company's result into Supabase via upsert_company.
+    Raw Tier 3 findings are written as-is, not blended into a single
+    subjective judgment, per the project's standing requirement.
+    """
+    name = custom_id_to_company.get(classification["custom_id"])
+    if not name:
+        return
 
-    If quota is confirmed exhausted partway through, SearchQuotaExceeded
-    propagates up to pipeline.py, which already handles it by writing out
-    whatever was resolved so far and sending a budget alert.
+    company_record = {
+        "name": name,
+        "name_cleaned": name,
+        "domain": None, "website": None, "industry": None,
+        "revenue_range": None, "staff_bucket": None,
+        "city": None, "state": None, "country": None, "description": None,
+        "company_type": classification.get("company_type", "needs_manual_review"),
+        "usable_lead": classification.get("usable_lead"),
+        "usable_lead_reason": classification.get("evidence"),
+        "classification_confidence": classification.get("confidence"),
+        "classification_source": "tier3_search_classify",
+        "classification_evidence": classification.get("evidence"),
+        "resolution_status": "auto_resolved" if classification.get("company_type") not in
+                              (None, "needs_manual_review", "data_garbage") else "needs_review",
+    }
+    with get_conn() as conn:
+        upsert_company(conn, company_record)
+
+
+def poll_and_apply_batch_results(batch_id: str, custom_id_to_company: dict) -> dict:
     """
-    search_results = asyncio.run(run_searches_with_checkpointing(companies))
+    Polls the Anthropic Batch API for up to BATCH_POLL_TIMEOUT_SECONDS.
+    If the batch finishes within that window, applies every classification
+    back into Supabase and returns {"completed": True, "applied_count": N}.
+    If it times out first, returns {"completed": False, "batch_id": batch_id}
+    so the caller can log it for manual follow-up rather than blocking forever.
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    elapsed = 0
+
+    while elapsed < BATCH_POLL_TIMEOUT_SECONDS:
+        batch = client.messages.batches.retrieve(batch_id)
+        if batch.processing_status == "ended":
+            applied = 0
+            for result in client.messages.batches.results(batch_id):
+                custom_id = result.custom_id
+                if result.result.type == "succeeded":
+                    text = result.result.message.content[0].text
+                    try:
+                        parsed = json.loads(text)
+                    except json.JSONDecodeError:
+                        parsed = {"company_type": "needs_manual_review", "usable_lead": None,
+                                  "confidence": 0.0,
+                                  "evidence": f"failed_to_parse_model_output: {text[:200]}"}
+                else:
+                    parsed = {"company_type": "needs_manual_review", "usable_lead": None,
+                              "confidence": 0.0,
+                              "evidence": f"batch_request_failed: {result.result.type}"}
+
+                parsed["custom_id"] = custom_id
+                apply_classification_to_supabase(custom_id_to_company, parsed)
+                applied += 1
+
+            print(f"Batch {batch_id} completed. Applied {applied} classifications to Supabase.")
+            return {"completed": True, "applied_count": applied}
+
+        time.sleep(BATCH_POLL_INTERVAL_SECONDS)
+        elapsed += BATCH_POLL_INTERVAL_SECONDS
+
+    print(f"Batch {batch_id} did not complete within {BATCH_POLL_TIMEOUT_SECONDS}s. "
+          f"It is still processing on Anthropic's side. Check back later with: "
+          f"client.messages.batches.retrieve('{batch_id}')")
+    return {"completed": False, "batch_id": batch_id}
+
+
+def submit_batch(companies: list[dict]) -> dict:
+    """
+    Runs all Tier 3 searches concurrently with checkpointing, submits a
+    batch job to the Anthropic Batch API, then attempts to poll and apply
+    results within BATCH_POLL_TIMEOUT_SECONDS. Returns a dict with the
+    batch_id, real search stats, and whether results were applied.
+    """
+    search_outcome = asyncio.run(run_searches_with_checkpointing(companies))
+    search_results = search_outcome["results"]
+    stats = search_outcome["stats"]
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     requests = build_batch_requests(companies, search_results)
+    custom_id_to_company = {r["custom_id"]: r["custom_id"].split("-", 2)[-1] for r in requests}
 
     batch = client.messages.batches.create(requests=requests)
     print(f"Submitted batch {batch.id} with {len(requests)} requests. Status: {batch.processing_status}")
-    return batch.id
 
+    batch_outcome = poll_and_apply_batch_results(batch.id, custom_id_to_company)
 
-def retrieve_batch_results(batch_id: str) -> list[dict]:
-    """
-    Polls/retrieves completed batch results. Call this after the batch
-    has finished processing (check status via client.messages.batches.retrieve).
-    """
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    results = []
-
-    for result in client.messages.batches.results(batch_id):
-        custom_id = result.custom_id
-        if result.result.type == "succeeded":
-            text = result.result.message.content[0].text
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                parsed = {"company_type": "needs_manual_review", "usable_lead": None,
-                          "confidence": 0.0, "evidence": f"failed_to_parse_model_output: {text[:200]}"}
-        else:
-            parsed = {"company_type": "needs_manual_review", "usable_lead": None,
-                      "confidence": 0.0, "evidence": f"batch_request_failed: {result.result.type}"}
-
-        results.append({"custom_id": custom_id, **parsed})
-
-    return results
+    return {
+        "batch_id": batch.id,
+        "stats": stats,
+        "batch_completed": batch_outcome["completed"],
+        "batch_applied_count": batch_outcome.get("applied_count", 0),
+    }
 
 
 if __name__ == "__main__":
@@ -342,7 +416,10 @@ if __name__ == "__main__":
     print(f"Submitting {len(residual)} companies to Tier 3 (search + Claude Haiku batch)...")
     companies = residual.to_dict("records")
 
-    batch_id = submit_batch(companies)
-    print(f"Batch submitted: {batch_id}")
-    print("Check status with: client.messages.batches.retrieve(batch_id)")
-    print("Once status is 'ended', run retrieve_batch_results(batch_id) to get classifications.")
+    outcome = submit_batch(companies)
+    print(f"Batch submitted: {outcome['batch_id']}")
+    print(f"Search stats: {outcome['stats']}")
+    if outcome["batch_completed"]:
+        print(f"Applied {outcome['batch_applied_count']} classifications to Supabase already.")
+    else:
+        print("Batch still processing, check back later.")

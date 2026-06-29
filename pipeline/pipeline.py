@@ -35,16 +35,13 @@ RAW_DIR = os.path.join(DATA_DIR, "raw_from_drive")
 MERGED_PATH = os.path.join(DATA_DIR, "leads.csv")
 OUTPUT_DIR = "outputs"
 
-# Column names as they appear in the merged source CSV.
-# IMPORTANT: real name data lives in the ".1" suffixed columns,
-# the plain "First Name"/"Last Name" columns are empty vendor artifacts.
 COL_FIRST_NAME = "First Name.1"
 COL_LAST_NAME = "Last Name.1"
 COL_FULL_NAME = "Contact Full Name"
 COL_TITLE = "Title"
-COL_EMAIL = "Email"
-COL_PHONE = "Phone"
-COL_LINKEDIN = "LinkedIn Url"
+COL_EMAIL = "Contact Email"
+COL_PHONE = "Contact Phone"
+COL_LINKEDIN = "Contact LI Profile URL"
 COL_NAME_CLEANED = "Company Name - Cleaned"
 
 
@@ -88,10 +85,6 @@ def build_person_record(row, company_id: str, raw_source_file: str) -> dict:
 
 def insert_people_for_company(conn, raw_df: pd.DataFrame, name_cleaned: str,
                                company_id: str, source_tag: str) -> int:
-    """
-    Looks up all contact rows for a company in the raw merged data
-    and inserts a person record for each one. Returns count inserted.
-    """
     if COL_NAME_CLEANED not in raw_df.columns:
         return 0
     group = raw_df[raw_df[COL_NAME_CLEANED] == name_cleaned]
@@ -168,8 +161,6 @@ def main():
 
     try:
         tagged = fetch_and_merge_source_data()
-
-        # Loaded once, reused for person-insertion lookups across all tiers
         raw_df = pd.read_csv(MERGED_PATH, dtype=str, low_memory=False)
 
         print(f"=== TIER 0: local signal resolution on {MERGED_PATH} ===")
@@ -183,7 +174,6 @@ def main():
         run_summary["companies_resolved"] += len(auto_resolved)
 
         with get_conn() as conn:
-            # Write Tier 0 auto-resolved companies
             for _, row in auto_resolved.iterrows():
                 company_record = {
                     "name": row["name"], "name_cleaned": row["name_cleaned"],
@@ -204,8 +194,6 @@ def main():
                 )
                 run_summary["companies_written_to_supabase"] += 1
 
-            # NEW: also write Tier 0 needs_review companies, tagged as such,
-            # so they're durable in Supabase even before Tier 1/3 touches them
             for _, row in needs_review.iterrows():
                 company_record = {
                     "name": row["name"], "name_cleaned": row["name_cleaned"],
@@ -260,8 +248,6 @@ def main():
             run_summary["companies_resolved"] += len(resolved_tier1)
 
             with get_conn() as conn:
-                # Update Tier 1 resolved companies (upsert overwrites the
-                # earlier needs_review row written in the Tier 0 step above)
                 for _, row in resolved_tier1.iterrows():
                     company_record = {
                         "name": row["name_cleaned"], "name_cleaned": row["name_cleaned"],
@@ -280,9 +266,6 @@ def main():
                         conn, raw_df, row["name_cleaned"], company_id, "tier1_website"
                     )
 
-                # NEW: also update residual (still unresolved after Tier 1)
-                # companies, tagged pending_tier3, so nothing is missing
-                # from Supabase while they wait for Tier 3
                 for _, row in residual.iterrows():
                     company_record = {
                         "name": row["name_cleaned"], "name_cleaned": row["name_cleaned"],
@@ -330,11 +313,28 @@ def main():
                 print(f"=== TIER 3: submitting {len(residual_companies)} companies to search + Claude batch ===")
 
             try:
-                batch_id = submit_batch(residual_companies)
-                print(f"Tier 3 batch submitted: {batch_id}")
-                print("Run `python pipeline_tier3_collect.py <batch_id>` once the batch finishes.")
+                outcome = submit_batch(residual_companies)
+                stats = outcome["stats"]
+
+                run_summary["api_calls_made"] += stats["api_calls_made"]
+                run_summary["cost_usd"] += stats["cost_usd"]
+                run_summary["failed_count"] += stats["failed_count"]
                 run_summary["needs_review_count"] += len(residual_companies)
+
+                print(f"Tier 3 batch submitted: {outcome['batch_id']}")
+                if outcome["batch_completed"]:
+                    print(f"Batch completed within the polling window, "
+                          f"{outcome['batch_applied_count']} classifications applied to Supabase.")
+                else:
+                    print(f"Batch still processing on Anthropic's side. "
+                          f"Batch ID logged for manual follow-up: {outcome['batch_id']}")
+
             except SearchQuotaExceeded as e:
+                stats = getattr(e, "stats", {})
+                run_summary["api_calls_made"] += stats.get("api_calls_made", 0)
+                run_summary["cost_usd"] += stats.get("cost_usd", 0.0)
+                run_summary["failed_count"] += stats.get("failed_count", 0)
+
                 print(f"=== SERPER QUOTA/RATE LIMIT EXCEEDED - stopping Tier 3 ===\n{e}")
                 print("Note: any companies already searched successfully before this error "
                       "are checkpointed in Supabase (tier3_search_log) and will be skipped, "
@@ -372,7 +372,8 @@ def main():
 
         send_run_completed(run_summary)
         print(f"=== Run complete. {run_summary['people_inserted']} people inserted. "
-              f"{run_summary['companies_written_to_supabase']} companies written to Supabase. ===")
+              f"{run_summary['companies_written_to_supabase']} companies written to Supabase. "
+              f"${run_summary['cost_usd']} estimated Tier 3 spend. ===")
 
     except Exception as e:
         error_text = traceback.format_exc()
