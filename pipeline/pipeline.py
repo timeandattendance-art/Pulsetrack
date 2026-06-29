@@ -4,7 +4,9 @@ pipeline.py - orchestrates the full PulseTrack run:
     1. Pull all source CSVs from the shared Google Drive folder
     2. Merge them into one dataframe, tagging conflicts (nothing deleted)
     3. Run Tier 0 -> Tier 1 -> Tier 3 exactly as before
-    4. Write resolved companies/people into Supabase
+    4. Write EVERY company into Supabase (not just auto-resolved ones),
+       tagged with its current resolution_status, so Supabase becomes
+       the single durable source of truth for the entire dataset
     5. Write three local CSVs: leads / manual_review / run_summary
     6. Send an email alert on completion, or immediately on hard failure
 
@@ -87,7 +89,7 @@ def build_person_record(row, company_id: str, raw_source_file: str) -> dict:
 def insert_people_for_company(conn, raw_df: pd.DataFrame, name_cleaned: str,
                                company_id: str, source_tag: str) -> int:
     """
-    Looks up all contact rows for a resolved company in the raw merged data
+    Looks up all contact rows for a company in the raw merged data
     and inserts a person record for each one. Returns count inserted.
     """
     if COL_NAME_CLEANED not in raw_df.columns:
@@ -161,6 +163,7 @@ def main():
         "api_calls_made": 0,
         "cost_usd": 0.0,
         "people_inserted": 0,
+        "companies_written_to_supabase": 0,
     }
 
     try:
@@ -180,6 +183,7 @@ def main():
         run_summary["companies_resolved"] += len(auto_resolved)
 
         with get_conn() as conn:
+            # Write Tier 0 auto-resolved companies
             for _, row in auto_resolved.iterrows():
                 company_record = {
                     "name": row["name"], "name_cleaned": row["name_cleaned"],
@@ -198,11 +202,35 @@ def main():
                 run_summary["people_inserted"] += insert_people_for_company(
                     conn, raw_df, row["name_cleaned"], company_id, "tier0_auto_resolved"
                 )
+                run_summary["companies_written_to_supabase"] += 1
+
+            # NEW: also write Tier 0 needs_review companies, tagged as such,
+            # so they're durable in Supabase even before Tier 1/3 touches them
+            for _, row in needs_review.iterrows():
+                company_record = {
+                    "name": row["name"], "name_cleaned": row["name_cleaned"],
+                    "domain": None, "website": None, "industry": None,
+                    "revenue_range": None, "staff_bucket": None,
+                    "city": None, "state": None, "country": None, "description": None,
+                    "company_type": row.get("company_type"),
+                    "usable_lead": row.get("usable_lead"),
+                    "usable_lead_reason": row.get("usable_lead_reason"),
+                    "classification_confidence": row.get("classification_confidence"),
+                    "classification_source": "tier0_signal",
+                    "classification_evidence": row.get("classification_evidence"),
+                    "resolution_status": "needs_review",
+                }
+                company_id = upsert_company(conn, company_record)
+                run_summary["people_inserted"] += insert_people_for_company(
+                    conn, raw_df, row["name_cleaned"], company_id, "tier0_needs_review"
+                )
+                run_summary["companies_written_to_supabase"] += 1
+
             log_pipeline_run(conn, "tier0", len(tier0_results), len(auto_resolved),
                               cost_usd=0.0, api_calls_made=0)
 
         print(f"Tier 0 resolved {len(auto_resolved)} / {len(tier0_results)} companies. "
-              f"{len(needs_review)} pass to Tier 1.")
+              f"{len(needs_review)} pass to Tier 1. All written to Supabase.")
 
         resolved_tier1 = pd.DataFrame()
         residual = pd.DataFrame()
@@ -232,6 +260,8 @@ def main():
             run_summary["companies_resolved"] += len(resolved_tier1)
 
             with get_conn() as conn:
+                # Update Tier 1 resolved companies (upsert overwrites the
+                # earlier needs_review row written in the Tier 0 step above)
                 for _, row in resolved_tier1.iterrows():
                     company_record = {
                         "name": row["name_cleaned"], "name_cleaned": row["name_cleaned"],
@@ -249,16 +279,34 @@ def main():
                     run_summary["people_inserted"] += insert_people_for_company(
                         conn, raw_df, row["name_cleaned"], company_id, "tier1_website"
                     )
+
+                # NEW: also update residual (still unresolved after Tier 1)
+                # companies, tagged pending_tier3, so nothing is missing
+                # from Supabase while they wait for Tier 3
+                for _, row in residual.iterrows():
+                    company_record = {
+                        "name": row["name_cleaned"], "name_cleaned": row["name_cleaned"],
+                        "domain": row.get("domain"), "website": row.get("domain"),
+                        "industry": None, "revenue_range": None, "staff_bucket": None,
+                        "city": None, "state": None, "country": None, "description": None,
+                        "company_type": None, "usable_lead": None,
+                        "usable_lead_reason": None,
+                        "classification_confidence": row.get("confidence"),
+                        "classification_source": "tier1_website",
+                        "classification_evidence": row.get("evidence"),
+                        "resolution_status": "pending_tier3",
+                    }
+                    upsert_company(conn, company_record)
+
                 log_pipeline_run(conn, "tier1", len(tier1_df), len(resolved_tier1),
                                   cost_usd=0.0, api_calls_made=0)
 
             print(f"Tier 1 resolved {len(resolved_tier1)} / {len(tier1_df)}. "
-                  f"{len(residual)} pass to Tier 3 (search + Claude batch).")
+                  f"{len(residual)} pass to Tier 3 (search + Claude batch). All written to Supabase.")
 
         if len(residual) > 0:
             residual_companies = residual.to_dict("records")
 
-            # Dedupe by name_cleaned before sending to Tier 3, and drop junk names
             seen_names = set()
             deduped = []
             for c in residual_companies:
@@ -287,13 +335,11 @@ def main():
                 print("Run `python pipeline_tier3_collect.py <batch_id>` once the batch finishes.")
                 run_summary["needs_review_count"] += len(residual_companies)
             except SearchQuotaExceeded as e:
-                # Anything searched successfully before this exception was already
-                # checkpointed to tier3_search_log in Supabase by submit_batch's
-                # internal checkpointing, it is NOT lost even though we stop here.
                 print(f"=== SERPER QUOTA/RATE LIMIT EXCEEDED - stopping Tier 3 ===\n{e}")
                 print("Note: any companies already searched successfully before this error "
                       "are checkpointed in Supabase (tier3_search_log) and will be skipped, "
-                      "not re-paid for, on the next run.")
+                      "not re-paid for, on the next run. All companies remain visible in "
+                      "the companies table tagged pending_tier3 either way.")
                 run_summary["needs_review_count"] += len(residual_companies)
                 write_split_outputs(tagged, run_summary)
                 with get_conn() as conn:
@@ -325,7 +371,8 @@ def main():
             )
 
         send_run_completed(run_summary)
-        print(f"=== Run complete. {run_summary['people_inserted']} people inserted. ===")
+        print(f"=== Run complete. {run_summary['people_inserted']} people inserted. "
+              f"{run_summary['companies_written_to_supabase']} companies written to Supabase. ===")
 
     except Exception as e:
         error_text = traceback.format_exc()
