@@ -1,43 +1,52 @@
 """
-alerts.py — sends run-completion and hard-failure emails via Gmail SMTP,
-using an app password (not the real account password).
+alerts.py — sends run-completion and hard-failure emails via Resend's
+HTTPS API, not SMTP. Railway blocks outbound SMTP (port 587), which is
+why the original smtplib-based version silently failed with
+"Network is unreachable" — switching to an HTTPS API call avoids that
+restriction entirely.
 
 Required env vars:
-    GMAIL_APP_PASSWORD  - the 16-character app password (no spaces)
-    ALERT_EMAIL_FROM    - sending address (must be the Gmail account the
-                          app password belongs to)
-    ALERT_EMAIL_TO      - destination address for alerts
+    RESEND_API_KEY      - your Resend API key (re_xxxxx...)
+    ALERT_EMAIL_FROM     - sending address (onboarding@resend.dev is fine
+                          for Resend's free tier, no domain verification needed)
+    ALERT_EMAIL_TO       - destination address for alerts
 """
 
 import os
-import smtplib
-from email.mime.text import MIMEText
+import httpx
 
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
+RESEND_API_URL = "https://api.resend.com/emails"
 
 
 def _send(subject: str, body: str) -> None:
-    password = os.environ.get("GMAIL_APP_PASSWORD")
+    api_key = os.environ.get("RESEND_API_KEY")
     sender = os.environ.get("ALERT_EMAIL_FROM")
     recipient = os.environ.get("ALERT_EMAIL_TO")
 
-    if not all([password, sender, recipient]):
+    if not all([api_key, sender, recipient]):
         print("[alerts] Email env vars not fully set — skipping alert, printing instead:")
         print(f"  SUBJECT: {subject}\n  BODY:\n{body}")
         return
 
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = recipient
-
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(sender, password)
-            server.sendmail(sender, [recipient], msg.as_string())
-        print(f"[alerts] Sent: {subject}")
+        resp = httpx.post(
+            RESEND_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": sender,
+                "to": [recipient],
+                "subject": subject,
+                "text": body,
+            },
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            print(f"[alerts] Sent: {subject}")
+        else:
+            print(f"[alerts] FAILED to send email (HTTP {resp.status_code}: {resp.text[:300]}) — continuing without alert.")
     except Exception as e:
         # Never let an alerting failure crash the pipeline itself.
         print(f"[alerts] FAILED to send email ({e}) — continuing without alert.")
@@ -53,6 +62,8 @@ def send_run_completed(run_summary: dict) -> None:
         f"Rate-limited (retried): {run_summary.get('rate_limited_count', 0)}\n"
         f"API calls made:       {run_summary.get('api_calls_made', 0)}\n"
         f"Total cost:           ${run_summary.get('cost_usd', 0):.2f}\n"
+        f"People inserted:      {run_summary.get('people_inserted', 0)}\n"
+        f"Companies written to Supabase: {run_summary.get('companies_written_to_supabase', 0)}\n"
     )
     _send(subject, body)
 
