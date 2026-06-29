@@ -8,12 +8,16 @@ Supabase (tier3_search_log) the moment it succeeds. This means a crash or
 restart mid-batch does not lose already-paid-for search results, and a
 resumed run will skip any company already searched successfully.
 
+Quota exhaustion detection: Serper does not reliably use 402/403 for an
+exhausted account, it has been observed returning a plain 400 Bad Request
+instead. So any 4xx response body is inspected for credit/quota wording
+before deciding whether it's a real bad request or a disguised quota error.
+Once quota exhaustion is confirmed, a shared stop signal halts all other
+in-flight concurrent workers immediately, so we don't keep burning failed
+calls against a dead key while the exception propagates.
+
 Uses the Anthropic Batch API (50% cheaper, async) since none of this needs
 to be real-time, it's a queue of leftover ambiguous companies.
-
-IMPORTANT: the classifier is instructed to default to needs_manual_review
-whenever evidence is thin, and is explicitly forbidden from flagging
-data_garbage without a concrete contradiction.
 """
 
 import json
@@ -79,11 +83,15 @@ Classify this company per the rules above."""
 SEARCH_CONCURRENCY = 8
 MAX_RETRIES = 4
 
+# Wording that, if found in a 4xx response body, confirms the account is
+# actually out of credits rather than the request itself being malformed.
+QUOTA_KEYWORDS = ("credit", "quota", "insufficient", "balance", "exceeded", "out of")
+
 
 class SearchQuotaExceeded(Exception):
-    """Raised when Serper returns a quota/payment error that persists
-    after retries, signals the caller to stop immediately rather than
-    keep burning calls against an exhausted/blocked key."""
+    """Raised when Serper confirms (via response body wording, not just
+    status code) that the account is out of credits, signals the caller
+    to stop immediately rather than keep burning calls against a dead key."""
     pass
 
 
@@ -96,15 +104,41 @@ def is_junk_name(name: str) -> bool:
     return False
 
 
+def looks_like_quota_error(status_code: int, body_text: str) -> bool:
+    """
+    Serper has been observed returning a plain 400 for an exhausted account
+    rather than 402/403. So any 4xx gets its body checked for quota wording
+    before we decide it's a real bad request vs a disguised quota error.
+    """
+    if status_code not in (400, 401, 402, 403):
+        return False
+    lowered = (body_text or "").lower()
+    return any(keyword in lowered for keyword in QUOTA_KEYWORDS)
+
+
 async def search_company_async(client: httpx.AsyncClient, company_name: str,
+                                 stop_event: asyncio.Event,
                                  n_results: int = 5, max_retries: int = MAX_RETRIES) -> tuple[str, str]:
     """
     Runs a Serper.dev Google search and returns (status, snippet_text).
-    status is "success" or "failed". Retries on timeouts, connection errors,
-    and 429s with exponential backoff. Raises SearchQuotaExceeded on 402/403.
+    status is "success", "failed", or "skipped_quota".
+
+    Checks stop_event before and during retries, if another concurrent
+    worker has already confirmed quota exhaustion, this stops immediately
+    rather than burning further retries against a dead key.
+
+    Raises SearchQuotaExceeded if THIS call is the one that confirms quota
+    exhaustion (via response body wording), which also sets stop_event so
+    every other in-flight worker stops too.
     """
+    if stop_event.is_set():
+        return "skipped_quota", "(skipped: quota already confirmed exhausted by another worker)"
+
     last_error = None
     for attempt in range(max_retries):
+        if stop_event.is_set():
+            return "skipped_quota", "(skipped mid-retry: quota confirmed exhausted by another worker)"
+
         try:
             resp = await client.post(
                 "https://google.serper.dev/search",
@@ -112,14 +146,24 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
                 json={"q": f"{company_name} CEO owner about", "num": n_results},
                 timeout=20,
             )
-            if resp.status_code in (402, 403):
-                raise SearchQuotaExceeded(
-                    f"Serper returned {resp.status_code} (payment/quota issue) for '{company_name}'."
-                )
-            if resp.status_code == 429:
-                last_error = f"429 rate-limited on attempt {attempt + 1}/{max_retries}"
+
+            if resp.status_code >= 400:
+                body_text = resp.text[:500]
+                if looks_like_quota_error(resp.status_code, body_text):
+                    stop_event.set()
+                    raise SearchQuotaExceeded(
+                        f"Serper confirmed quota exhaustion for '{company_name}': "
+                        f"HTTP {resp.status_code}, body: {body_text}"
+                    )
+                if resp.status_code == 429:
+                    last_error = f"429 rate-limited on attempt {attempt + 1}/{max_retries}, body: {body_text}"
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                # Genuine 4xx that isn't a quota signal, e.g. a real bad request
+                last_error = f"HTTP {resp.status_code} (non-quota), body: {body_text}"
                 await asyncio.sleep(2 ** attempt)
                 continue
+
             resp.raise_for_status()
             data = resp.json()
             results = data.get("organic", [])
@@ -130,10 +174,11 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
                 snippets.append(f"- {title}: {desc}")
             text = "\n".join(snippets) if snippets else "(no search results found)"
             return "success", text
+
         except SearchQuotaExceeded:
             raise
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
-            last_error = str(e)
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            last_error = f"connection error: {str(e)}"
             await asyncio.sleep(2 ** attempt)
             continue
 
@@ -146,6 +191,11 @@ async def run_searches_with_checkpointing(companies: list[dict]) -> dict:
     successfully in a prior run, and checkpoints each result to Supabase
     immediately as it completes. Returns {company_name: snippets} for all
     companies, combining cached results with newly searched ones.
+
+    If quota exhaustion is confirmed mid-run, all remaining un-started
+    companies are checkpointed as "skipped_quota" rather than burned
+    through with retries, and SearchQuotaExceeded is raised once all
+    in-flight workers have wound down.
     """
     with get_conn() as conn:
         already_done = get_already_searched_companies(conn)
@@ -170,26 +220,38 @@ async def run_searches_with_checkpointing(companies: list[dict]) -> dict:
 
     results = dict(already_done)
     semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
-    counters = {"success": 0, "failed": 0}
+    stop_event = asyncio.Event()
+    counters = {"success": 0, "failed": 0, "skipped_quota": 0}
+    quota_error_holder = {"error": None}
 
     async def worker(client, company):
         name = company["name_cleaned"]
         async with semaphore:
-            status, snippets = await search_company_async(client, name)
+            try:
+                status, snippets = await search_company_async(client, name, stop_event)
+            except SearchQuotaExceeded as e:
+                quota_error_holder["error"] = e
+                status, snippets = "skipped_quota", str(e)
         with get_conn() as conn:
             log_tier3_search(conn, name, snippets, status)
         results[name] = snippets
         counters[status] += 1
-        done = counters["success"] + counters["failed"]
+        done = sum(counters.values())
         if done % 100 == 0:
             print(f"  Tier 3 search progress: {done}/{len(to_search)} "
-                  f"({counters['success']} ok, {counters['failed']} failed)")
+                  f"({counters['success']} ok, {counters['failed']} failed, "
+                  f"{counters['skipped_quota']} skipped_quota)")
 
     async with httpx.AsyncClient() as client:
         tasks = [worker(client, c) for c in to_search]
         await asyncio.gather(*tasks)
 
-    print(f"Tier 3 search complete: {counters['success']} succeeded, {counters['failed']} failed.")
+    print(f"Tier 3 search complete: {counters['success']} succeeded, "
+          f"{counters['failed']} failed, {counters['skipped_quota']} skipped due to quota.")
+
+    if quota_error_holder["error"] is not None:
+        raise quota_error_holder["error"]
+
     return results
 
 
@@ -228,6 +290,10 @@ def submit_batch(companies: list[dict]):
     """
     Runs all Tier 3 searches concurrently with checkpointing, then submits
     a batch job to the Anthropic Batch API. Returns the batch id.
+
+    If quota is confirmed exhausted partway through, SearchQuotaExceeded
+    propagates up to pipeline.py, which already handles it by writing out
+    whatever was resolved so far and sending a budget alert.
     """
     search_results = asyncio.run(run_searches_with_checkpointing(companies))
 
