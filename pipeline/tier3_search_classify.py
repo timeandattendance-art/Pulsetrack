@@ -130,10 +130,6 @@ def looks_like_quota_error(status_code: int, body_text: str) -> bool:
 async def search_company_async(client: httpx.AsyncClient, company_name: str,
                                  stop_event: asyncio.Event, call_counter: dict,
                                  n_results: int = 6, max_retries: int = MAX_RETRIES) -> tuple[str, str]:
-    """
-    Runs a Serper.dev search for "{company_name} CEO" and returns
-    (status, snippet_text). status is "success", "failed", or "skipped_quota".
-    """
     if stop_event.is_set():
         return "skipped_quota", "(skipped: quota already confirmed exhausted by another worker)"
 
@@ -193,10 +189,6 @@ async def search_company_async(client: httpx.AsyncClient, company_name: str,
 def classify_with_claude(client: anthropic.Anthropic, company_name: str,
                           candidate_names: list[str], snippets: str,
                           claude_stats: dict) -> dict:
-    """
-    Single synchronous Claude call. Tracks REAL token usage and cost from
-    response.usage into claude_stats (shared across all calls in this run).
-    """
     candidate_list = "\n".join(f"- {name}" for name in candidate_names)
     user_msg = USER_TEMPLATE.format(
         company_name=company_name,
@@ -212,8 +204,6 @@ def classify_with_claude(client: anthropic.Anthropic, company_name: str,
             messages=[{"role": "user", "content": user_msg}],
         )
 
-        # Real token counts, not an estimate — Anthropic returns exact
-        # usage on every response.
         input_tokens = response.usage.input_tokens
         output_tokens = response.usage.output_tokens
         call_cost = (input_tokens * CLAUDE_INPUT_COST_PER_TOKEN +
@@ -237,10 +227,6 @@ def classify_with_claude(client: anthropic.Anthropic, company_name: str,
 
 
 def build_per_contact_flags(candidate_names: list[str], classification: dict) -> dict:
-    """
-    Given the company-level classification, returns {contact_name: {ceo_tf,
-    duplicate_flag, structure_flag}} for every candidate at this company.
-    """
     structure = classification.get("company_type", "needs_manual_review")
     confirmed_name = classification.get("confirmed_name")
 
@@ -264,12 +250,6 @@ def build_per_contact_flags(candidate_names: list[str], classification: dict) ->
 
 
 async def run_conflict_resolution(companies: list[dict]) -> dict:
-    """
-    For each conflicted company (each dict must have 'name_cleaned' and
-    'candidate_names'), searches concurrently, checkpoints to Supabase,
-    classifies via Claude, and returns per-contact flags plus real
-    cost/token stats for both Serper and Claude.
-    """
     shared_conn_ctx = get_conn()
     shared_conn = shared_conn_ctx.__enter__()
     conn_lock = asyncio.Lock()
@@ -335,13 +315,18 @@ async def run_conflict_resolution(companies: list[dict]) -> dict:
         quota_error_holder["error"].stats = stats
         raise quota_error_holder["error"]
 
-    # Now classify each company with Claude — real token cost tracked here.
+    # Classify ALL companies that have snippets — including already-searched
+    # ones from prior runs, not just the newly searched ones. This is the
+    # fix for the bug where checkpointed companies were skipped in the
+    # Claude classification loop and never made it into per_contact_flags.
     claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     claude_stats = {"calls_made": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     per_contact_flags = {}
 
-    for company in to_search:
+    for company in companies:
         name = company["name_cleaned"]
+        if is_junk_name(name):
+            continue
         candidate_names = company.get("candidate_names", [])
         snippets = snippets_by_company.get(name, "(no search results found)")
         classification = classify_with_claude(claude_client, name, candidate_names, snippets, claude_stats)
@@ -362,14 +347,6 @@ async def run_conflict_resolution(companies: list[dict]) -> dict:
 
 
 def submit_batch(companies: list[dict]) -> dict:
-    """
-    companies: list of dicts, each with 'name_cleaned' and 'candidate_names'
-    (the list of contact names claiming the conflicted top title).
-
-    Returns {"per_contact_flags": {...}, "stats": {...}} where stats now
-    includes both serper_cost_usd (estimate) and claude_cost_usd (real,
-    token-based), plus total_cost_usd.
-    """
     return asyncio.run(run_conflict_resolution(companies))
 
 
