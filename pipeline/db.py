@@ -9,6 +9,13 @@ a real Python None before anything reaches a SQL query. Without this,
 pandas NaN (a float) gets passed to psycopg2 and Postgres rejects it when
 compared against a text column (e.g. "operator does not exist: text =
 double precision"), which crashed a real run on the domain field.
+
+canonical_key() is a single normalization function used everywhere company
+names and contact names are used as dictionary keys or stored in the
+checkpoint table. This ensures the same string format is used at write
+time, read time, and final CSV merge time, preventing silent key mismatches
+that cause the checkpoint to appear empty and Tier 3 results to never
+attach to output rows.
 """
 
 import math
@@ -16,6 +23,18 @@ import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
 from pipeline.config import SUPABASE_DB_URL
+
+
+def canonical_key(value: str) -> str:
+    """
+    Normalizes a company or contact name for use as a dictionary key or
+    checkpoint table key. Strips leading/trailing whitespace, collapses
+    internal whitespace, and uppercases. Used everywhere names are stored
+    or looked up so key mismatches never silently drop results.
+    """
+    if not value or not isinstance(value, str):
+        return ""
+    return " ".join(value.strip().upper().split())
 
 
 def sanitize_value(val):
@@ -170,33 +189,43 @@ def log_pipeline_run(conn, tier: str, processed: int, resolved: int, notes: str 
 
 def log_tier3_search(conn, company_name: str, snippets: str, status: str):
     """
-    Checkpoint a single Tier 3 search result immediately after it completes,
-    so a crash mid-batch doesn't lose (or force re-paying for) work already done.
+    Checkpoint a single Tier 3 search result immediately after it completes.
+    Uses canonical_key() for the lookup key so checkpoint reads always match
+    checkpoint writes regardless of casing or whitespace differences.
+    Upserts so reruns update rather than duplicate rows.
     """
+    company_key = canonical_key(company_name)
     cur = conn.cursor()
     cur.execute(
         """
-        insert into tier3_search_log (company_name, snippets, status)
-        values (%s, %s, %s)
+        insert into tier3_search_log (company_name, company_key, snippets, status)
+        values (%s, %s, %s, %s)
+        on conflict (company_key)
+        do update set
+            snippets = excluded.snippets,
+            status = excluded.status,
+            searched_at = now()
         """,
-        (company_name, snippets, status),
+        (company_name, company_key, snippets, status),
     )
 
 
 def get_already_searched_companies(conn) -> dict:
     """
-    Returns a dict of {company_name: snippets} for every company that already
-    has a successful Tier 3 search logged, so a resumed run can skip them
-    instead of paying Serper again for the same company.
+    Returns {canonical_key: snippets} for every company with a successful
+    Tier 3 search logged. Uses company_key (the normalized form) as the
+    dict key so lookups in tier3_search_classify.py always match regardless
+    of raw name formatting differences.
     """
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
         """
-        select distinct on (company_name) company_name, snippets
+        select company_key, snippets
         from tier3_search_log
         where status = 'success'
-        order by company_name, searched_at desc
         """
     )
     rows = cur.fetchall()
-    return {row["company_name"]: row["snippets"] for row in rows}
+    result = {row["company_key"]: row["snippets"] for row in rows}
+    print(f"  Checkpoint loaded: {len(result)} companies already searched.")
+    return result

@@ -14,24 +14,21 @@ CSV with every original column intact plus three new columns:
     Company Structure Flag  — the detected company_type (e.g. franchise_unit,
                               multi_partner_firm), blank if not yet determined
 
+All lookups use canonical_key() from db.py so company name and contact name
+mismatches between Tier 3 output and the dataframe never silently drop rows.
+
 Logic per row:
     - If title_type != "singular_top": this contact never claimed the
       disputed title at all, leave all three columns blank.
     - If title_type == "singular_top" and true_conflict == False: only
-      one person claims this role at this company, auto-confirmed,
-      CEO T/F = true, Duplicate blank, structure_flag = standalone_business
-      (no search was needed or run).
+      one person claims this role here — auto-confirmed, no search needed.
+      CEO T/F = true, Duplicate blank, structure_flag = standalone_business.
     - If title_type == "singular_top" and true_conflict == True: look up
-      this exact company + contact name in Tier 3's per_contact_flags.
-      If found, use those real values. If the company hasn't been resolved
-      by Tier 3 yet (e.g. quota ran out, or law firm/membership org which
-      Tier 3 deliberately leaves blank), columns stay blank for manual review.
-
-Email/phone columns get reordered (best candidate first, do_not_mail
-flagged) using the same logic as reorder_contacts.py.
-
-Usage:
-    python -m pipeline.build_final_output data/leads.csv tier3_results.json outputs/final_leads.csv
+      this exact company + contact name in Tier 3's per_contact_flags using
+      canonical keys. If found, use those real values. If the company has
+      not been resolved yet (quota ran out, law firm/membership org left
+      blank on purpose, or this run has not reached it yet), columns stay
+      blank for manual review.
 """
 
 import sys
@@ -39,6 +36,7 @@ import json
 import pandas as pd
 
 from pipeline.reorder_contacts import process_dataframe
+from pipeline.db import canonical_key
 
 NAME_COL = "Company Name - Cleaned"
 CONTACT_NAME_COL = "Contact Full Name"
@@ -48,9 +46,9 @@ TRUE_CONFLICT_COL = "true_conflict"
 
 def load_tier3_results(json_path: str) -> dict:
     """
-    Returns {company_name: {contact_name: {ceo_tf, duplicate_flag,
-    structure_flag}}}. Returns an empty dict if the file doesn't exist
-    yet (e.g. no conflicts were found, or Tier 3 hasn't run).
+    Returns {canonical_company_key: {canonical_contact_key: {ceo_tf,
+    duplicate_flag, structure_flag}}}. Returns an empty dict if the file
+    does not exist yet.
     """
     try:
         with open(json_path, "r") as f:
@@ -64,23 +62,18 @@ def load_tier3_results(json_path: str) -> dict:
 def resolve_row_flags(row, tier3_results: dict) -> dict:
     title_type = row.get(TITLE_TYPE_COL, "other")
     true_conflict = bool(row.get(TRUE_CONFLICT_COL, False))
-    company_name = row.get(NAME_COL, "")
-    contact_name = row.get(CONTACT_NAME_COL, "")
+    company_name = canonical_key(row.get(NAME_COL, ""))
+    contact_name = canonical_key(row.get(CONTACT_NAME_COL, ""))
 
     if title_type != "singular_top":
-        # Never claimed the disputed top title — not part of this at all.
         return {"CEO T/F": "", "Duplicate": "", "Company Structure Flag": ""}
 
     if not true_conflict:
-        # Only one person claims this role here — auto-confirmed, no search needed.
         return {"CEO T/F": "true", "Duplicate": "", "Company Structure Flag": "standalone_business"}
 
-    # Genuine conflict — look up Tier 3's resolution for this exact contact.
     company_flags = tier3_results.get(company_name, {})
     contact_flags = company_flags.get(contact_name)
     if contact_flags is None:
-        # Not yet resolved (quota ran out, law firm/membership org left
-        # blank on purpose, or this run hasn't reached it yet).
         structure = company_flags.get("_structure_fallback", "")
         return {"CEO T/F": "", "Duplicate": "", "Company Structure Flag": structure}
 
@@ -93,11 +86,32 @@ def resolve_row_flags(row, tier3_results: dict) -> dict:
 
 def append_ceo_columns(df: pd.DataFrame, tier3_results: dict) -> pd.DataFrame:
     ceo_tf_vals, dup_vals, structure_vals = [], [], []
+    company_miss = 0
+    contact_miss = 0
+    matched = 0
+
     for _, row in df.iterrows():
+        title_type = row.get(TITLE_TYPE_COL, "other")
+        true_conflict = bool(row.get(TRUE_CONFLICT_COL, False))
+
+        if title_type == "singular_top" and true_conflict:
+            company_name = canonical_key(row.get(NAME_COL, ""))
+            contact_name = canonical_key(row.get(CONTACT_NAME_COL, ""))
+            company_flags = tier3_results.get(company_name, {})
+            if not company_flags:
+                company_miss += 1
+            elif contact_name not in company_flags:
+                contact_miss += 1
+            else:
+                matched += 1
+
         flags = resolve_row_flags(row, tier3_results)
         ceo_tf_vals.append(flags["CEO T/F"])
         dup_vals.append(flags["Duplicate"])
         structure_vals.append(flags["Company Structure Flag"])
+
+    print(f"Tier 3 merge diagnostics: {matched} rows matched, "
+          f"{company_miss} company key misses, {contact_miss} contact key misses.")
 
     df["CEO T/F"] = ceo_tf_vals
     df["Duplicate"] = dup_vals
@@ -120,8 +134,7 @@ if __name__ == "__main__":
 
     for required_col in (NAME_COL, CONTACT_NAME_COL, TITLE_TYPE_COL, TRUE_CONFLICT_COL):
         if required_col not in df.columns:
-            print(f"ERROR: expected column '{required_col}' not found — "
-                  f"make sure this is the tagged output from merge_and_tag, not the raw source CSV.")
+            print(f"ERROR: expected column '{required_col}' not found.")
             sys.exit(1)
 
     print("Reordering email/phone columns (best candidate first)...")
@@ -140,5 +153,3 @@ if __name__ == "__main__":
 
     df.to_csv(output_path, index=False)
     print(f"Wrote {len(df)} rows -> {output_path}")
-    print("ONE file, all original columns preserved, email/phone reordered, "
-          "CEO T/F / Duplicate / Company Structure Flag appended per-row.")

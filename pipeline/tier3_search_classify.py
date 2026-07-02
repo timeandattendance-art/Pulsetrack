@@ -6,29 +6,11 @@ which named contact is the actual current leader, weighing recency so a
 stepped-down former CEO doesn't override a more recent successor. Also
 detects franchise and law-firm/membership-org structures.
 
-Search calls run concurrently using ONE shared Postgres connection protected
-by an asyncio.Lock. Each result is checkpointed to Supabase (tier3_search_log)
-the moment it succeeds, so a crash or restart mid-batch does not lose
-already-paid-for search results.
-
-Quota exhaustion detection: Serper has been observed returning a plain 400
-Bad Request for an exhausted account rather than 402/403, so any 4xx body
-is inspected for credit/quota wording before deciding it's a real bad
-request vs a disguised quota error. A shared stop signal halts all other
-in-flight workers once quota exhaustion is confirmed.
-
-Cost tracking: serper_cost_usd is an ESTIMATE ($0.001/call, based on the
-$50-per-50,000-credit tier). claude_cost_usd is REAL, calculated from the
-actual input/output token counts returned by every Claude API response
-(Haiku 4.5 rates: $1/million input tokens, $5/million output tokens).
-
-Output per conflicted company: a list of per-contact results, each with
-ceo_tf ("true"/"false"), duplicate_flag ("duplicate" or ""), and
-structure_flag (the detected company_type). For franchises, the same
-search/resolve logic applies. For multi_partner_firm and
-membership_or_chapter_org, NO search or auto-resolution is attempted —
-those get structure_flag set and ceo_tf/duplicate_flag left blank,
-per explicit instruction to leave them for manual review.
+All dictionary keys (company names, contact names) are normalized via
+canonical_key() from db.py before being stored or looked up. This ensures
+the checkpoint table, per_contact_flags, and the final CSV merge all use
+the same string format, preventing silent mismatches that cause results to
+disappear.
 """
 
 import json
@@ -36,7 +18,7 @@ import asyncio
 import httpx
 import anthropic
 from pipeline.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, SERPER_API_KEY, TIER3_BATCH_SIZE
-from pipeline.db import get_conn, log_tier3_search, get_already_searched_companies
+from pipeline.db import get_conn, log_tier3_search, get_already_searched_companies, canonical_key
 
 SYSTEM_PROMPT = """You are a careful data-classification assistant for a B2B lead database.
 
@@ -95,22 +77,17 @@ Identify the current leader per the rules above."""
 
 SEARCH_CONCURRENCY = 8
 MAX_RETRIES = 4
-SERPER_COST_PER_CALL_ESTIMATE = 0.001  # based on $50 / 50,000 credits
+SERPER_COST_PER_CALL_ESTIMATE = 0.001
 
-# Real Claude Haiku 4.5 rates, per token (not per million) — used to
-# calculate exact cost from response.usage on every call.
 CLAUDE_INPUT_COST_PER_TOKEN = 1.00 / 1_000_000
 CLAUDE_OUTPUT_COST_PER_TOKEN = 5.00 / 1_000_000
 
 QUOTA_KEYWORDS = ("credit", "quota", "insufficient", "balance", "exceeded", "out of")
 
-# These structure types get NO search, NO auto-resolution — flagged and left alone.
 NO_RESOLVE_TYPES = {"multi_partner_firm", "membership_or_chapter_org"}
 
 
 class SearchQuotaExceeded(Exception):
-    """Raised when Serper confirms (via response body wording, not just
-    status code) that the account is out of credits."""
     pass
 
 
@@ -227,25 +204,32 @@ def classify_with_claude(client: anthropic.Anthropic, company_name: str,
 
 
 def build_per_contact_flags(candidate_names: list[str], classification: dict) -> dict:
+    """
+    Returns {canonical_contact_key: {ceo_tf, duplicate_flag, structure_flag}}
+    for every candidate. Keys are normalized via canonical_key() so lookups
+    in build_final_output.py always match regardless of name formatting.
+    """
     structure = classification.get("company_type", "needs_manual_review")
     confirmed_name = classification.get("confirmed_name")
+    confirmed_key = canonical_key(confirmed_name) if confirmed_name else None
 
     flags = {}
     if structure in NO_RESOLVE_TYPES:
         for name in candidate_names:
-            flags[name] = {"ceo_tf": "", "duplicate_flag": "", "structure_flag": structure}
+            flags[canonical_key(name)] = {"ceo_tf": "", "duplicate_flag": "", "structure_flag": structure}
         return flags
 
-    if not confirmed_name:
+    if not confirmed_key:
         for name in candidate_names:
-            flags[name] = {"ceo_tf": "", "duplicate_flag": "", "structure_flag": structure}
+            flags[canonical_key(name)] = {"ceo_tf": "", "duplicate_flag": "", "structure_flag": structure}
         return flags
 
     for name in candidate_names:
-        if name == confirmed_name:
-            flags[name] = {"ceo_tf": "true", "duplicate_flag": "", "structure_flag": structure}
+        name_key = canonical_key(name)
+        if name_key == confirmed_key:
+            flags[name_key] = {"ceo_tf": "true", "duplicate_flag": "", "structure_flag": structure}
         else:
-            flags[name] = {"ceo_tf": "false", "duplicate_flag": "duplicate", "structure_flag": structure}
+            flags[name_key] = {"ceo_tf": "false", "duplicate_flag": "duplicate", "structure_flag": structure}
     return flags
 
 
@@ -264,7 +248,9 @@ async def run_conflict_resolution(companies: list[dict]) -> dict:
         if is_junk_name(name) or name in seen:
             continue
         seen.add(name)
-        to_search.append(company)
+        company_key = canonical_key(name)
+        if company_key not in already_done:
+            to_search.append(company)
 
     snippets_by_company = dict(already_done)
     semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
@@ -275,8 +261,7 @@ async def run_conflict_resolution(companies: list[dict]) -> dict:
 
     async def worker(client, company):
         name = company["name_cleaned"]
-        if name in already_done:
-            return
+        company_key = canonical_key(name)
         async with semaphore:
             try:
                 status, snippets = await search_company_async(client, name, stop_event, call_counter)
@@ -288,7 +273,7 @@ async def run_conflict_resolution(companies: list[dict]) -> dict:
             log_tier3_search(shared_conn, name, snippets, status)
             shared_conn.commit()
 
-        snippets_by_company[name] = snippets
+        snippets_by_company[company_key] = snippets
         counters[status] += 1
 
     try:
@@ -315,10 +300,6 @@ async def run_conflict_resolution(companies: list[dict]) -> dict:
         quota_error_holder["error"].stats = stats
         raise quota_error_holder["error"]
 
-    # Classify ALL companies that have snippets — including already-searched
-    # ones from prior runs, not just the newly searched ones. This is the
-    # fix for the bug where checkpointed companies were skipped in the
-    # Claude classification loop and never made it into per_contact_flags.
     claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     claude_stats = {"calls_made": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     per_contact_flags = {}
@@ -327,15 +308,18 @@ async def run_conflict_resolution(companies: list[dict]) -> dict:
         name = company["name_cleaned"]
         if is_junk_name(name):
             continue
+        company_key = canonical_key(name)
         candidate_names = company.get("candidate_names", [])
-        snippets = snippets_by_company.get(name, "(no search results found)")
+        snippets = snippets_by_company.get(company_key, "(no search results found)")
         classification = classify_with_claude(claude_client, name, candidate_names, snippets, claude_stats)
-        per_contact_flags[name] = build_per_contact_flags(candidate_names, classification)
+        per_contact_flags[company_key] = build_per_contact_flags(candidate_names, classification)
 
     claude_stats["cost_usd"] = round(claude_stats["cost_usd"], 4)
     print(f"Tier 3 classification complete: {claude_stats['calls_made']} Claude calls, "
           f"{claude_stats['input_tokens']} input tokens, {claude_stats['output_tokens']} output tokens, "
           f"${claude_stats['cost_usd']} real cost.")
+    print(f"Tier 3 per_contact_flags built for {len(per_contact_flags)} companies.")
+    print(f"Sample company keys: {list(per_contact_flags.keys())[:5]}")
 
     stats["claude_calls_made"] = claude_stats["calls_made"]
     stats["claude_input_tokens"] = claude_stats["input_tokens"]
